@@ -1,4 +1,3 @@
-cat > README.md << 'EOF'
 # CDISC Library API Proxy
 
 <div align="center">
@@ -613,4 +612,3 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 <div align="center">
 Made with ❤️ for the clinical research community
 </div>
-EOF
