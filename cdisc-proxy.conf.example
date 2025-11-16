@@ -1,0 +1,33 @@
+server:
+  port: 8080
+  # IP addresses to listen on (supports both IPv4 and IPv6)
+  # Leave empty or omit to listen on all interfaces (0.0.0.0)
+  listen:
+    - "0.0.0.0"           # Listen on all IPv4 interfaces
+    - "::"                # Listen on all IPv6 interfaces
+    # - "127.0.0.1"       # Listen only on localhost IPv4
+    # - "::1"             # Listen only on localhost IPv6
+    # - "192.168.1.100"   # Listen on specific IPv4 address
+    # - "2001:db8::1"     # Listen on specific IPv6 address
+  
+  # API key for protecting the /refresh endpoint
+  # Generate a strong random key: openssl rand -hex 32
+  auth_key: "your-secure-auth-key-here"
+
+cdisc:
+  base_url: "https://library.cdisc.org/api"
+  # Your CDISC Library API key
+  api_key: "your-cdisc-api-key-here"
+
+valkey:
+  address: "localhost:6379"
+  password: ""  # Leave empty if no password
+  db: 0         # Default database
+
+cache:
+  # Cache time-to-live (TTL) - how long to keep cached responses
+  # Supports multiple formats:
+  #   - Go duration format: "24h", "30m", "168h"
+  #   - Custom formats: "1y" (year), "7d" (days), "2w" (weeks)
+  # Default: "1y" (1 year)
+  ttl: "1y"

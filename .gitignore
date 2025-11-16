@@ -1,0 +1,103 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+cdisc-proxy
+cdisc-proxy-*
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+coverage.txt
+coverage.html
+
+# Go workspace file
+go.work
+go.work.sum
+
+# Dependency directories
+vendor/
+
+# Go build cache
+.cache/
+
+# Configuration files with secrets
+config.yaml
+*.conf
+!config.yaml.example
+!*.conf.example
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Log files
+*.log
+logs/
+/var/log/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.iml
+
+# Debug files
+debug
+__debug_bin
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# OS generated files
+Thumbs.db
+.Spotlight-V100
+.Trashes
+
+# Build artifacts
+dist/
+build/
+bin/
+
+# Alpine/Linux package files
+*.apk
+*.tar.gz
+*.tgz
+
+# Documentation build artifacts
+docs/_build/
+site/
+
+# Backup files
+*.bak
+*.backup
+*~
+
+# Test coverage
+profile.cov
+
+# Private keys and certificates
+*.key
+*.pem
+*.crt
+*.p12
+*.pfx
+
+# Database files (if using local SQLite for testing)
+*.db
+*.sqlite
+*.sqlite3
+
+# Redis/Valkey dump files
+dump.rdb
+appendonly.aof
