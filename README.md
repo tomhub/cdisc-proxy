@@ -598,7 +598,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - [CDISC](https://www.cdisc.org/) - For providing the clinical data standards and API
 - [Valkey](https://valkey.io/) - High-performance key-value store
 - Go Community - For excellent tools and libraries
-
+- Microsoft Copilot GPT-5 - for implementation of the idea
 ---
 
 ## 📞 Support
