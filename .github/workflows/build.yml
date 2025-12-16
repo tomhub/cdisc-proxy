@@ -11,7 +11,7 @@ on:
       - main
 
 env:
-  GO_VERSION: '1.21'
+  GO_VERSION: 'latest'
   APP_NAME: 'cdisc-proxy'
 
 jobs:
