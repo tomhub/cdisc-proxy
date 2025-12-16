@@ -150,11 +150,15 @@ jobs:
         run: |
           if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
             VERSION="${GITHUB_REF#refs/tags/v}"
+            RPM_VERSION="$VERSION"
           else
+            # RPM doesn't allow hyphens in version, use tilde for pre-release
             VERSION="0.0.0-dev"
+            RPM_VERSION="0.0.0~dev"
           fi
           echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "Building version: $VERSION"
+          echo "rpm_version=$RPM_VERSION" >> $GITHUB_OUTPUT
+          echo "Building version: $VERSION (RPM: $RPM_VERSION)"
 
       - name: Install RPM Build Tools
         run: |
@@ -163,7 +167,7 @@ jobs:
 
       - name: Create RPM Package
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
+          VERSION="${{ steps.version.outputs.rpm_version }}"
           mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
           mkdir -p package/usr/local/bin
           
