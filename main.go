@@ -713,9 +713,11 @@ func (ps *ProxyServer) saveToL2(key string, data []byte, group string) error {
 }
 
 func main() {
-	cfgFile := "config.yaml"
 	if len(os.Args) > 1 {
 		cfgFile = os.Args[1]
+	}
+	else {
+		cfgFile := "/etc/conf.d/cdisc-proxy.conf"
 	}
 
 	data, err := os.ReadFile(cfgFile)
