@@ -372,6 +372,18 @@ func validateConfig(cfg Config) error {
 	return nil
 }
 
+func (ps *ProxyServer) saveToL1WithShortTTL(key string, data []byte, ttl time.Duration) {
+	ps.wg.Add(1)
+	go func() {
+		defer ps.wg.Done()
+		ctx, cancel := context.WithTimeout(ps.ctx, 5*time.Second)
+		defer cancel()
+		if err := ps.l1Client.Do(ctx,
+			ps.l1Client.B().Set().Key(key).Value(string(data)).Ex(ttl).Build()).Error(); err != nil {
+			log.Printf("L1 short-TTL save failed for %s: %v", key, err)
+		}
+	}()
+}
 
 func (ps *ProxyServer) Close() error {
 	ps.cancel()
@@ -472,31 +484,42 @@ func (ps *ProxyServer) handleProxy(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    if status == 200 {
-        // Save to L2 (Persistence)
-        ps.mu.Lock()
-        if err := ps.saveToL2(cacheKey, respBody, prodGroup); err != nil {
-            log.Printf("L2 save failed for %s: %v", cacheKey, err)
-        }
-        ps.mu.Unlock()
+	if status == 200 {
+		// Save to L2 (Persistence)
+		ps.mu.Lock()
+		if err := ps.saveToL2(cacheKey, respBody, prodGroup); err != nil {
+			log.Printf("L2 save failed for %s: %v", cacheKey, err)
+		}
+		ps.mu.Unlock()
 
-        // Save to L1 (RAM) - async
-        ps.wg.Add(1)
-        go func() {
-            defer ps.wg.Done()
-            ctx, cancel := context.WithTimeout(ps.ctx, 5*time.Second)
-            defer cancel()
-            if err := ps.l1Client.Do(ctx,
-                ps.l1Client.B().Set().Key(cacheKey).Value(string(respBody)).Ex(ps.l1TTL).Build()).Error(); err != nil {
-                log.Printf("L1 save failed for %s: %v", cacheKey, err)
-            }
-        }()
-    }
+		// Save to L1 (RAM) - async
+		ps.wg.Add(1)
+		go func() {
+			defer ps.wg.Done()
+			ctx, cancel := context.WithTimeout(ps.ctx, 5*time.Second)
+			defer cancel()
+			if err := ps.l1Client.Do(ctx,
+				ps.l1Client.B().Set().Key(cacheKey).Value(string(respBody)).Ex(ps.l1TTL).Build()).Error(); err != nil {
+				log.Printf("L1 save failed for %s: %v", cacheKey, err)
+			}
+		}()
 
-    w.Header().Set("X-Cache-Tier", "MISS")
-    w.Header().Set("Content-Type", "application/json")
-    w.WriteHeader(status)
-    w.Write(respBody)
+		w.Header().Set("X-Cache-Tier", "MISS")
+	} else if status == 400 || status == 404 {
+		// Save to L1 not found or bad request for 30 minutes
+		// to avoid upstream annoyance
+		ps.saveToL1WithShortTTL(cacheKey, respBody, 30*time.Minute)
+		w.Header().Set("X-Cache-Tier", "MISS")
+		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	} else {
+		// Don't cache other errors (5xx, etc.)
+		w.Header().Set("X-Cache-Tier", "MISS")
+		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	w.Write(respBody)
 }
 
 func (ps *ProxyServer) fetchFromCDISC(path string) ([]byte, int, error) {
