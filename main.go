@@ -15,10 +15,10 @@ import (
 	"time"
 	"strconv"
 
-	_ "github.com/duckdb/duckdb-go/v2"
 	"github.com/goccy/go-yaml"
 	_ "github.com/lib/pq"
 	"github.com/valkey-io/valkey-go"
+	"github.com/dgraph-io/badger/v4"
 )
 
 const (
@@ -45,7 +45,7 @@ type Config struct {
 			TTL     string `yaml:"ttl"`
 		} `yaml:"l1"`
 		L2 struct {
-			DuckDBPath      string `yaml:"duckdb_path"`
+			BadgerPath      string `yaml:"badger_path"`
 			PostgresDSN     string `yaml:"postgres_dsn"`
 			TTL             string `yaml:"ttl"`
 			CleanupEnabled  bool   `yaml:"cleanup_enabled"`
@@ -82,38 +82,83 @@ type StorageAdapter interface {
 }
 
 // --- Storage Implementations ---
-
-type DuckDBAdapter struct {
-	db *sql.DB
+type BadgerAdapter struct {
+    db *badger.DB
 }
 
-func (d *DuckDBAdapter) UpsertCache(key string, data []byte, expiresAt time.Time, group string) error {
-	_, err := d.db.Exec("INSERT OR REPLACE INTO cdisc_cache VALUES ($1, $2, $3, $4)", key, data, expiresAt, group)
-	return err
+type cacheEntry struct {
+    Data      []byte
+    ExpiresAt time.Time
+    Group     string
 }
 
-func (d *DuckDBAdapter) UpsertSystemMeta(key, val string) error {
-	_, err := d.db.Exec("INSERT OR REPLACE INTO system_meta VALUES ($1, $2)", key, val)
-	return err
+func (b *BadgerAdapter) UpsertCache(key string, data []byte, expiresAt time.Time, group string) error {
+    entry := cacheEntry{Data: data, ExpiresAt: expiresAt, Group: group}
+    val, err := json.Marshal(entry)
+    if err != nil {
+        return err
+    }
+    return b.db.Update(func(txn *badger.Txn) error {
+        return txn.Set([]byte(key), val)
+    })
 }
 
-func (d *DuckDBAdapter) UpsertProductMeta(id, ts string) error {
-	_, err := d.db.Exec("INSERT OR REPLACE INTO product_meta VALUES ($1, $2)", id, ts)
-	return err
+func (b *BadgerAdapter) UpsertSystemMeta(key, val string) error {
+    return b.db.Update(func(txn *badger.Txn) error {
+        return txn.Set([]byte("system:"+key), []byte(val))
+    })
 }
 
-func (d *DuckDBAdapter) DeleteByProductGroup(group string) error {
-	_, err := d.db.Exec("DELETE FROM cdisc_cache WHERE product_group = $1", group)
-	return err
+func (b *BadgerAdapter) UpsertProductMeta(id, ts string) error {
+    return b.db.Update(func(txn *badger.Txn) error {
+        return txn.Set([]byte("product:"+id), []byte(ts))
+    })
 }
 
-func (d *DuckDBAdapter) CleanupExpired() (int64, error) {
-	result, err := d.db.Exec("DELETE FROM cdisc_cache WHERE expires_at < $1", time.Now())
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected()
+func (b *BadgerAdapter) DeleteByProductGroup(group string) error {
+    // Scan all keys and delete those with matching group
+    return b.db.Update(func(txn *badger.Txn) error {
+        it := txn.NewIterator(badger.DefaultIteratorOptions)
+        defer it.Close()
+        prefix := []byte("cdisc:cache:")
+        for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+            item := it.Item()
+            val, err := item.ValueCopy(nil)
+            if err != nil {
+                continue
+            }
+            var entry cacheEntry
+            if err := json.Unmarshal(val, &entry); err == nil && entry.Group == group {
+                txn.Delete(item.KeyCopy(nil))
+            }
+        }
+        return nil
+    })
 }
+
+func (b *BadgerAdapter) CleanupExpired() (int64, error) {
+    var count int64
+    err := b.db.Update(func(txn *badger.Txn) error {
+        it := txn.NewIterator(badger.DefaultIteratorOptions)
+        defer it.Close()
+        now := time.Now()
+        for it.Rewind(); it.Valid(); it.Next() {
+            item := it.Item()
+            val, err := item.ValueCopy(nil)
+            if err != nil {
+                continue
+            }
+            var entry cacheEntry
+            if err := json.Unmarshal(val, &entry); err == nil && now.After(entry.ExpiresAt) {
+                txn.Delete(item.KeyCopy(nil))
+                count++
+            }
+        }
+        return nil
+    })
+    return count, err
+}
+
 
 type PostgresAdapter struct {
 	db *sql.DB
@@ -223,18 +268,18 @@ func NewProxyServer(ctx context.Context, cfg Config) (*ProxyServer, error) {
 	}
 	ps.l1Client = l1Client
 
-	// Init L2 (DuckDB or Postgres)
+	// Init L2 (BadgerDB or Postgres)
 	var db *sql.DB
 	var storage StorageAdapter
-
-	if cfg.Cache.L2.DuckDBPath != "" {
-		db, err = sql.Open("duckdb", cfg.Cache.L2.DuckDBPath)
+	if cfg.Cache.L2.BadgerPath != "" {
+		opts := badger.DefaultOptions(cfg.Cache.L2.BadgerPath).WithLogger(nil)
+		db, err := badger.Open(opts)
 		if err != nil {
 			cancel()
 			l1Client.Close()
-			return nil, fmt.Errorf("DuckDB init failed: %w", err)
+			return nil, fmt.Errorf("Badger init failed: %w", err)
 		}
-		storage = &DuckDBAdapter{db: db}
+	    storage = &BadgerAdapter{db: db}
 	} else {
 		db, err = sql.Open("postgres", cfg.Cache.L2.PostgresDSN)
 		if err != nil {
@@ -255,12 +300,6 @@ func NewProxyServer(ctx context.Context, cfg Config) (*ProxyServer, error) {
 
 	ps.l2Db = db
 	ps.storage = storage
-
-	// Bootstrap Schema
-	if err := ps.initSchema(); err != nil {
-		ps.Close()
-		return nil, fmt.Errorf("schema init failed: %w", err)
-	}
 
 	// Start background tasks
 	if cfg.Scheduler.Enabled {
@@ -292,53 +331,15 @@ func validateConfig(cfg Config) error {
 	if cfg.Cache.L1.Address == "" {
 		return errors.New("L1 address is required")
 	}
-	if cfg.Cache.L2.DuckDBPath == "" && cfg.Cache.L2.PostgresDSN == "" {
-		return errors.New("either DuckDB path or Postgres DSN is required")
+	if cfg.Cache.L2.BadgerPath == "" && cfg.Cache.L2.PostgresDSN == "" {
+		return errors.New("either BadgerDB path or Postgres DSN is required")
 	}
-	if cfg.Cache.L2.DuckDBPath != "" && cfg.Cache.L2.PostgresDSN != "" {
-		return errors.New("configure either DuckDB or Postgres, not both")
+	if cfg.Cache.L2.BadgerPath != "" && cfg.Cache.L2.PostgresDSN != "" {
+		return errors.New("configure either BadgerDB or Postgres, not both")
 	}
 	return nil
 }
 
-func (ps *ProxyServer) initSchema() error {
-	schemas := []string{
-		`CREATE TABLE IF NOT EXISTS cdisc_cache (
-			key TEXT PRIMARY KEY, 
-			data BLOB, 
-			expires_at TIMESTAMP, 
-			product_group TEXT
-		)`,
-		`CREATE TABLE IF NOT EXISTS product_meta (
-			product_id TEXT PRIMARY KEY, 
-			last_update TEXT
-		)`,
-		`CREATE TABLE IF NOT EXISTS system_meta (
-			key TEXT PRIMARY KEY, 
-			val TEXT
-		)`,
-	}
-
-	for _, schema := range schemas {
-		if _, err := ps.l2Db.Exec(schema); err != nil {
-			return err
-		}
-	}
-
-	// Create indexes for better performance
-	indexes := []string{
-		`CREATE INDEX IF NOT EXISTS idx_cache_expires ON cdisc_cache(expires_at)`,
-		`CREATE INDEX IF NOT EXISTS idx_cache_product ON cdisc_cache(product_group)`,
-	}
-
-	for _, idx := range indexes {
-		if _, err := ps.l2Db.Exec(idx); err != nil {
-			log.Printf("Warning: index creation failed: %v", err)
-		}
-	}
-
-	return nil
-}
 
 func (ps *ProxyServer) Close() error {
 	ps.cancel()
