@@ -79,7 +79,9 @@ type StorageAdapter interface {
     UpsertProductMeta(id, ts string) error
     DeleteByProductGroup(group string) error
     CleanupExpired() (int64, error)
-    GetCache(key string) ([]byte, time.Time, error) 
+    GetCache(key string) ([]byte, time.Time, error)
+	GetSystemMeta(key string) (string, error)
+	GetProductMeta(id string) (string, error)
 }
 
 type CachedResponse struct {
@@ -185,6 +187,32 @@ func (b *BadgerAdapter) GetCache(key string) ([]byte, time.Time, error) {
     return entry.Data, entry.ExpiresAt, nil
 }
 
+func (b *BadgerAdapter) GetSystemMeta(key string) (string, error) {
+    var val []byte
+    err := b.db.View(func(txn *badger.Txn) error {
+        item, err := txn.Get([]byte("system:" + key))
+        if err != nil {
+            return err
+        }
+        val, err = item.ValueCopy(nil)
+        return err
+    })
+    return string(val), err
+}
+
+func (b *BadgerAdapter) GetProductMeta(id string) (string, error) {
+    var val []byte
+    err := b.db.View(func(txn *badger.Txn) error {
+        item, err := txn.Get([]byte("product:" + id))
+        if err != nil {
+            return err
+        }
+        val, err = item.ValueCopy(nil)
+        return err
+    })
+    return string(val), err
+}
+
 
 type PostgresAdapter struct {
 	db *sql.DB
@@ -232,6 +260,18 @@ func (p *PostgresAdapter) GetCache(key string) ([]byte, time.Time, error) {
     err := p.db.QueryRow("SELECT data, expires_at FROM cdisc_cache WHERE key=$1", key).
         Scan(&data, &expiresAt)
     return data, expiresAt, err
+}
+
+func (p *PostgresAdapter) GetSystemMeta(key string) (string, error) {
+    var val string
+    err := p.db.QueryRow("SELECT val FROM system_meta WHERE key=$1", key).Scan(&val)
+    return val, err
+}
+
+func (p *PostgresAdapter) GetProductMeta(id string) (string, error) {
+    var ts string
+    err := p.db.QueryRow("SELECT last_update FROM product_meta WHERE product_id=$1", id).Scan(&ts)
+    return ts, err
 }
 
 
@@ -510,9 +550,18 @@ func (ps *ProxyServer) handleProxy(w http.ResponseWriter, r *http.Request) {
 	respBody, status, err := ps.fetchFromCDISC(path)
 	if err != nil {
 		log.Printf("CDISC API error for %s: %v", path, err)
-		http.Error(w, "CDISC API Error", http.StatusBadGateway)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		w.Write([]byte(`{"error":"CDISC API Error","status":502}`))
 		return
 	}
+
+	if status < 100 {
+		log.Printf("Invalid status %d from upstream, forcing 502", status)
+		status = http.StatusBadGateway
+		respBody = []byte(`{"error":"Invalid upstream status","status":502}`)
+	}
+
 
 	// 3. L1 [miss] -> L2 [miss] -> upstream -> reply -> L1 [set] -> L2 [set]
 	// Save with status code
@@ -574,9 +623,13 @@ func (ps *ProxyServer) fetchFromCDISC(path string) ([]byte, int, error) {
 
 	resp, err := ps.httpClient.Do(req)
 	if err != nil {
-		return nil, 0, err
+		return nil, http.StatusBadGateway, err
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode < 100 {
+		resp.StatusCode = http.StatusBadGateway
+	}
 
 	// Limit response size
 	limitedReader := io.LimitReader(resp.Body, maxResponseSize)
@@ -617,87 +670,80 @@ func (ps *ProxyServer) runScheduler() {
 }
 
 func (ps *ProxyServer) checkAndSync() error {
-	// 1. Check Global /mdr/lastupdated
-	body, status, err := ps.fetchFromCDISC("/mdr/lastupdated")
-	if err != nil || status != 200 {
-		return fmt.Errorf("failed to fetch last updated: %w", err)
-	}
+    body, status, err := ps.fetchFromCDISC("/mdr/lastupdated")
+    if err != nil || status != 200 {
+        return fmt.Errorf("failed to fetch last updated: %w", err)
+    }
 
-	var global struct {
-		LastUpdated string `json:"lastUpdated"`
-	}
-	if err := json.Unmarshal(body, &global); err != nil {
-		return fmt.Errorf("failed to parse last updated: %w", err)
-	}
+    var global struct {
+        LastUpdated string `json:"lastUpdated"`
+    }
+    if err := json.Unmarshal(body, &global); err != nil {
+        return fmt.Errorf("failed to parse last updated: %w", err)
+    }
 
-	var lastSeen string
-	err = ps.l2Db.QueryRowContext(ps.ctx, "SELECT val FROM system_meta WHERE key = 'global_ts'").Scan(&lastSeen)
-	if err != nil && err != sql.ErrNoRows {
-		return fmt.Errorf("failed to query global_ts: %w", err)
-	}
+    lastSeen, err := ps.storage.GetSystemMeta("global_ts")
+    if err != nil && err != sql.ErrNoRows {
+        return fmt.Errorf("failed to query global_ts: %w", err)
+    }
 
-	if global.LastUpdated != lastSeen {
-		log.Printf("[Scheduler] Update detected: %s. Syncing products...", global.LastUpdated)
-		if err := ps.syncAndInvalidateProducts(global.LastUpdated); err != nil {
-			return err
-		}
-	}
-
-	return nil
+    if global.LastUpdated != lastSeen {
+        log.Printf("[Scheduler] Update detected: %s. Syncing products...", global.LastUpdated)
+        if err := ps.syncAndInvalidateProducts(global.LastUpdated); err != nil {
+            return err
+        }
+    }
+    return nil
 }
 
 func (ps *ProxyServer) syncAndInvalidateProducts(newGlobalTs string) error {
-	body, status, err := ps.fetchFromCDISC("/mdr/products")
-	if err != nil || status != 200 {
-		return fmt.Errorf("failed to fetch products: %w", err)
-	}
+    body, status, err := ps.fetchFromCDISC("/mdr/products")
+    if err != nil || status != 200 {
+        return fmt.Errorf("failed to fetch products: %w", err)
+    }
 
-	var catalog struct {
-		Products []struct {
-			ID          string `json:"id"`
-			LastUpdated string `json:"lastUpdated"`
-		} `json:"products"`
-	}
-	if err := json.Unmarshal(body, &catalog); err != nil {
-		return fmt.Errorf("failed to parse products: %w", err)
-	}
+    var catalog struct {
+        Products []struct {
+            ID          string `json:"id"`
+            LastUpdated string `json:"lastUpdated"`
+        } `json:"products"`
+    }
+    if err := json.Unmarshal(body, &catalog); err != nil {
+        return fmt.Errorf("failed to parse products: %w", err)
+    }
 
-	for _, p := range catalog.Products {
-		var localTs string
-		err := ps.l2Db.QueryRowContext(ps.ctx, "SELECT last_update FROM product_meta WHERE product_id = $1", p.ID).Scan(&localTs)
-		if err != nil && err != sql.ErrNoRows {
-			log.Printf("[Scheduler] Error checking product %s: %v", p.ID, err)
-			continue
-		}
+    for _, p := range catalog.Products {
+        localTs, err := ps.storage.GetProductMeta(p.ID)
+        if err != nil && err != sql.ErrNoRows {
+            log.Printf("[Scheduler] Error checking product %s: %v", p.ID, err)
+            continue
+        }
 
-		if p.LastUpdated != localTs {
-			log.Printf("[Scheduler] Invalidating out-of-date product: %s", p.ID)
+        if p.LastUpdated != localTs {
+            log.Printf("[Scheduler] Invalidating out-of-date product: %s", p.ID)
 
-			// SQL Invalidation
-			ps.mu.Lock()
-			if err := ps.storage.DeleteByProductGroup(strings.ToLower(p.ID)); err != nil {
-				log.Printf("[Scheduler] L2 invalidation failed for %s: %v", p.ID, err)
-			}
-			ps.mu.Unlock()
+            ps.mu.Lock()
+            if err := ps.storage.DeleteByProductGroup(strings.ToLower(p.ID)); err != nil {
+                log.Printf("[Scheduler] L2 invalidation failed for %s: %v", p.ID, err)
+            }
+            ps.mu.Unlock()
 
-			// Smart L1 Invalidation
-			if err := ps.invalidateL1ByPrefix("cdisc:cache:/mdr/" + strings.ToLower(p.ID)); err != nil {
-				log.Printf("[Scheduler] L1 invalidation failed for %s: %v", p.ID, err)
-			}
+            if err := ps.invalidateL1ByPrefix("cdisc:cache:/mdr/" + strings.ToLower(p.ID)); err != nil {
+                log.Printf("[Scheduler] L1 invalidation failed for %s: %v", p.ID, err)
+            }
 
-			// Update Metadata
-			if err := ps.storage.UpsertProductMeta(p.ID, p.LastUpdated); err != nil {
-				log.Printf("[Scheduler] Product meta update failed for %s: %v", p.ID, err)
-			}
-		}
-	}
+            if err := ps.storage.UpsertProductMeta(p.ID, p.LastUpdated); err != nil {
+                log.Printf("[Scheduler] Product meta update failed for %s: %v", p.ID, err)
+            }
+        }
+    }
 
-	if err := ps.storage.UpsertSystemMeta("global_ts", newGlobalTs); err != nil {
-		return fmt.Errorf("failed to update global_ts: %w", err)
-	}
-
-	return nil
+    if err := ps.storage.UpsertSystemMeta("global_ts", newGlobalTs); err != nil {
+        return fmt.Errorf("failed to update global_ts: %w", err)
+    }
+    return nil
 }
+
 
 func (ps *ProxyServer) invalidateL1ByPrefix(prefix string) error {
 	// For Dragonfly, we use larger batch sizes to leverage its multi-threaded DEL
