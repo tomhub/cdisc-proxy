@@ -82,6 +82,11 @@ type StorageAdapter interface {
     GetCache(key string) ([]byte, time.Time, error) 
 }
 
+type CachedResponse struct {
+	StatusCode int    `json:"status_code"`
+	Body       []byte `json:"body"`
+}
+
 
 // --- Storage Implementations ---
 type BadgerAdapter struct {
@@ -372,14 +377,24 @@ func validateConfig(cfg Config) error {
 	return nil
 }
 
-func (ps *ProxyServer) saveToL1WithShortTTL(key string, data []byte, ttl time.Duration) {
+func (ps *ProxyServer) saveToL1WithShortTTL(key string, data []byte, status int, ttl time.Duration) {
+	cached := CachedResponse{
+		StatusCode: status,
+		Body:       data,
+	}
+	cachedBytes, err := json.Marshal(cached)
+	if err != nil {
+		log.Printf("Failed to marshal cached response: %v", err)
+		return
+	}
+
 	ps.wg.Add(1)
 	go func() {
 		defer ps.wg.Done()
 		ctx, cancel := context.WithTimeout(ps.ctx, 5*time.Second)
 		defer cancel()
 		if err := ps.l1Client.Do(ctx,
-			ps.l1Client.B().Set().Key(key).Value(string(data)).Ex(ttl).Build()).Error(); err != nil {
+			ps.l1Client.B().Set().Key(key).Value(string(cachedBytes)).Ex(ttl).Build()).Error(); err != nil {
 			log.Printf("L1 short-TTL save failed for %s: %v", key, err)
 		}
 	}()
@@ -421,7 +436,6 @@ func (ps *ProxyServer) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 }
 
 // handleProxy implements the Smart Logic
-// handleProxy implements the Smart Logic
 func (ps *ProxyServer) handleProxy(w http.ResponseWriter, r *http.Request) {
     path := strings.TrimPrefix(r.URL.Path, "/api")
 
@@ -435,80 +449,106 @@ func (ps *ProxyServer) handleProxy(w http.ResponseWriter, r *http.Request) {
     prodGroup := ps.identifyProductGroup(path)
 
     // 1. L1 [hit] -> reply -> L1 [TTL update]
+	// L1 HIT - Check for cached status
     val, err := ps.l1Client.Do(ps.ctx, ps.l1Client.B().Get().Key(cacheKey).Build()).AsBytes()
-    if err == nil {
-        // Asynchronous TTL update so we don't block the response
-        ps.wg.Add(1)
-        go func() {
-            defer ps.wg.Done()
-            ctx, cancel := context.WithTimeout(ps.ctx, 5*time.Second)
-            defer cancel()
-            if err := ps.l1Client.Do(ctx,
-                ps.l1Client.B().Expire().Key(cacheKey).Seconds(int64(ps.l1TTL.Seconds())).Build()).Error(); err != nil {
-                log.Printf("L1 TTL update failed for %s: %v", cacheKey, err)
-            }
-        }()
+	if err == nil {
+		var cached CachedResponse
+		if err := json.Unmarshal(val, &cached); err == nil {
+			// Successfully parsed cached response with status
+			ps.wg.Add(1)
+			go func() {
+				defer ps.wg.Done()
+				ctx, cancel := context.WithTimeout(ps.ctx, 5*time.Second)
+				defer cancel()
+				if err := ps.l1Client.Do(ctx,
+					ps.l1Client.B().Expire().Key(cacheKey).Seconds(int64(ps.l1TTL.Seconds())).Build()).Error(); err != nil {
+					log.Printf("L1 TTL update failed for %s: %v", cacheKey, err)
+				}
+			}()
 
-        w.Header().Set("X-Cache-Tier", "L1-HIT")
-        w.Header().Set("Content-Type", "application/json")
-        w.Write(val)
-        return
-    }
+			w.Header().Set("X-Cache-Tier", "L1-HIT")
+			w.Header().Set("Content-Type", "application/json")
+			if cached.StatusCode != 200 {
+				w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+			}
+			w.WriteHeader(cached.StatusCode)
+			w.Write(cached.Body)
+			return
+		}
+		// Fall through if unmarshal fails (legacy cache format)
+	}
 
     // 2. L1 [miss] -> L2 [hit] -> reply -> L1 [set]
-    data, expiresAt, err := ps.storage.GetCache(cacheKey)
-    if err == nil && time.Now().Before(expiresAt) {
-        // Promote back to L1
-        ps.wg.Add(1)
-        go func() {
-            defer ps.wg.Done()
-            ctx, cancel := context.WithTimeout(ps.ctx, 5*time.Second)
-            defer cancel()
-            if err := ps.l1Client.Do(ctx,
-                ps.l1Client.B().Set().Key(cacheKey).Value(string(data)).Ex(ps.l1TTL).Build()).Error(); err != nil {
-                log.Printf("L1 promotion failed for %s: %v", cacheKey, err)
-            }
-        }()
-
-        w.Header().Set("X-Cache-Tier", "L2-HIT")
-        w.Header().Set("Content-Type", "application/json")
-        w.Write(data)
-        return
-    }
-
-    // 3. L1 [miss] -> L2 [miss] -> upstream -> reply -> L1 [set] -> L2 [set]
-    respBody, status, err := ps.fetchFromCDISC(path)
-    if err != nil {
-        log.Printf("CDISC API error for %s: %v", path, err)
-        http.Error(w, "CDISC API Error", http.StatusBadGateway)
-        return
-    }
-
-	if status == 200 {
-		// Save to L2 (Persistence)
-		ps.mu.Lock()
-		if err := ps.saveToL2(cacheKey, respBody, prodGroup); err != nil {
-			log.Printf("L2 save failed for %s: %v", cacheKey, err)
+	// L2 HIT - Also needs status code storage
+	// For now, L2 only stores 200 responses, so this is safe
+	data, expiresAt, err := ps.storage.GetCache(cacheKey)
+	if err == nil && time.Now().Before(expiresAt) {
+		// Promote back to L1 (as 200 response since L2 only stores successful responses)
+		cached := CachedResponse{
+			StatusCode: 200,
+			Body:       data,
 		}
-		ps.mu.Unlock()
+		cachedBytes, _ := json.Marshal(cached)
 
-		// Save to L1 (RAM) - async
 		ps.wg.Add(1)
 		go func() {
 			defer ps.wg.Done()
 			ctx, cancel := context.WithTimeout(ps.ctx, 5*time.Second)
 			defer cancel()
 			if err := ps.l1Client.Do(ctx,
-				ps.l1Client.B().Set().Key(cacheKey).Value(string(respBody)).Ex(ps.l1TTL).Build()).Error(); err != nil {
-				log.Printf("L1 save failed for %s: %v", cacheKey, err)
+				ps.l1Client.B().Set().Key(cacheKey).Value(string(cachedBytes)).Ex(ps.l1TTL).Build()).Error(); err != nil {
+				log.Printf("L1 promotion failed for %s: %v", cacheKey, err)
 			}
 		}()
 
+		w.Header().Set("X-Cache-Tier", "L2-HIT")
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(data)
+		return
+	}
+
+	respBody, status, err := ps.fetchFromCDISC(path)
+	if err != nil {
+		log.Printf("CDISC API error for %s: %v", path, err)
+		http.Error(w, "CDISC API Error", http.StatusBadGateway)
+		return
+	}
+
+	// 3. L1 [miss] -> L2 [miss] -> upstream -> reply -> L1 [set] -> L2 [set]
+	// Save with status code
+
+	
+	if status == 200 {
+		// Save to L2 (Persistence) - only 200s
+		ps.mu.Lock()
+		if err := ps.saveToL2(cacheKey, respBody, prodGroup); err != nil {
+			log.Printf("L2 save failed for %s: %v", cacheKey, err)
+		}
+		ps.mu.Unlock()
+
+		// Save to L1 (RAM) with status code
+		cached := CachedResponse{
+			StatusCode: status,
+			Body:       respBody,
+		}
+		cachedBytes, err := json.Marshal(cached)
+		if err == nil {
+			ps.wg.Add(1)
+			go func() {
+				defer ps.wg.Done()
+				ctx, cancel := context.WithTimeout(ps.ctx, 5*time.Second)
+				defer cancel()
+				if err := ps.l1Client.Do(ctx,
+					ps.l1Client.B().Set().Key(cacheKey).Value(string(cachedBytes)).Ex(ps.l1TTL).Build()).Error(); err != nil {
+					log.Printf("L1 save failed for %s: %v", cacheKey, err)
+				}
+			}()
+		}
+
 		w.Header().Set("X-Cache-Tier", "MISS")
 	} else if status == 400 || status == 404 {
-		// Save to L1 not found or bad request for 30 minutes
-		// to avoid upstream annoyance
-		ps.saveToL1WithShortTTL(cacheKey, respBody, 30*time.Minute)
+		// Save to L1 with short TTL
+		ps.saveToL1WithShortTTL(cacheKey, respBody, status, 30*time.Minute)
 		w.Header().Set("X-Cache-Tier", "MISS")
 		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 	} else {
