@@ -2,11 +2,11 @@
 
 <div align="center">
 
-![Go Version](https://img.shields.io/badge/Go-1.21+-00ADD8?style=flat&logo=go)
+![Go Version](https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat&logo=go)
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Alpine-lightgrey)
 
-A high-performance caching proxy server for the [CDISC Library API](https://www.cdisc.org/cdisc-library) with persistent storage in Valkey/Redis.
+A high-performance caching proxy server for the [CDISC Library API](https://www.cdisc.org/cdisc-library) with in-memory L1 caching (Valkey/Redis/Dragonfly) and persistent L2 storage (DuckDB or PostgreSQL).
 
 [Features](#features) • [Quick Start](#quick-start) • [Configuration](#configuration) • [API Usage](#api-usage) • [Deployment](#deployment)
 
@@ -38,8 +38,7 @@ A high-performance caching proxy server for the [CDISC Library API](https://www.
 ## ✨ Features
 
 - 🚀 **High Performance** - Built with Go for speed and efficiency
-- 💾 **Persistent Caching** - Stores responses in Valkey/Redis with configurable TTL
-- 🔄 **Force Refresh** - Authenticated endpoint to update cached data on demand
+- 💾 **Persistent Caching** - Stores responses in Valkey/Redis and DuckDB with configurable TTL 
 - 🌐 **Multi-Interface Support** - Listen on multiple IPv4/IPv6 addresses simultaneously
 - 🔒 **Secure** - Bearer token authentication for sensitive operations
 - 📊 **Health Checks** - Built-in health monitoring endpoint
@@ -51,7 +50,7 @@ A high-performance caching proxy server for the [CDISC Library API](https://www.
 
 ## 🤔 Why Use This Proxy?
 
-The CDISC Library API provides valuable metadata about clinical trial data standards, but:
+### The CDISC Library API provides valuable metadata about clinical trial data standards, but:
 
 - **Rate Limiting** - Direct API calls may be rate-limited
 - **Performance** - Reduce latency by caching frequently accessed resources
@@ -59,12 +58,20 @@ The CDISC Library API provides valuable metadata about clinical trial data stand
 - **Cost Efficiency** - Minimize API calls to stay within usage limits
 - **Offline Development** - Work with cached CDISC metadata without constant internet connectivity
 
+### Key 'Smart' Features:
+- **Driver-Specific Invalidation:** The invalidateL1ByPrefix function detects Dragonfly and increases the SCAN count to 1000. Dragonfly’s multi-threaded DEL handles these massive batches across CPU cores, whereas it uses UNLINK for Valkey to avoid blocking the single-threaded event loop.
+
+- **Hierarchical Sync:** The scheduler maintains local metadata tables (product_meta) in your L2 database. It only purges cache entries for products that the CDISC API confirms have a new lastUpdated timestamp.
+
+- **L1 Promotion:** Any L1 miss that results in an L2 hit automatically "warms" the L1 tier again. This keeps your high-memory RAM tier focused on the data your team is actually requesting.
+
+- **Environment Reconstruction:** Because your L2 is persistent (DuckDB file or Postgres), the environment can be fully reconstructed. If L1 is wiped, the proxy seamlessly repopulates it from L2 without overloading the CDISC Library API.
 ---
 
 ## 📦 Prerequisites
 
-- **Go** 1.21 or later
-- **Valkey** or **Redis** server
+- **Go** 1.25 or later
+- **Valkey** or **Redis** or **DragonflyDB** server
 - **CDISC Library API Key** - [Get one here](https://www.cdisc.org/cdisc-library)
 
 ---
@@ -81,9 +88,7 @@ cd cdisc-proxy
 ### 2. Install Dependencies
 
 ```bash
-go mod init cdisc-proxy
-go get github.com/valkey-io/valkey-go
-go get gopkg.in/yaml.v3
+go mod tidy
 ```
 
 ### 3. Build
@@ -99,8 +104,8 @@ go build -o cdisc-proxy main.go
 sudo mkdir -p /etc/conf.d
 
 # Copy and edit configuration
-cp config.yaml /etc/conf.d/cdisc-proxy.conf
-nano /etc/conf.d/cdisc-proxy.conf
+cp cdisc-proxy.conf.example /etc/conf.d/cdisc-proxy.conf
+nano /etc/conf.d/cdisc-proxy.conf 
 ```
 
 **Required Configuration:**
@@ -126,42 +131,18 @@ Or specify a custom config:
 
 The proxy uses a YAML configuration file located at `/etc/conf.d/cdisc-proxy.conf` by default.
 
-### Example Configuration
+[Example Configuration](/cdisc.proxy.conf.example)
 
-```yaml
-server:
-  port: 8080
-  listen:
-    - "0.0.0.0"      # All IPv4 interfaces
-    - "::"           # All IPv6 interfaces
-  auth_key: "your-secure-random-key-here"
+Configure L1 and L2 caches, L1 will be in memory, L2 for long-term, persistant storage.
+A request will go to:
+  L1 [hit] -> reply -> L1 [TTL update]
+  L1 [miss] -> L2 [hit] -> reply -> L1 [set]
+  L1 [miss] -> L2 [miss] -> upstream -> reply -> L1 [set] -> L2 [set]
 
-cdisc:
-  base_url: "https://library.cdisc.org/api"
-  api_key: "your-cdisc-api-key"
+Scheduled invalidation
+  - **Scheduler** [Detects Update] -> Delete from L1 -> Delete from L2
 
-valkey:
-  address: "localhost:6379"
-  password: ""
-  db: 0
-
-cache:
-  ttl: "1y"  # Supports: 24h, 7d, 30d, 1y, etc.
-```
-
-### Configuration Options
-
-| Section | Option | Description | Default |
-|---------|--------|-------------|---------|
-| `server.port` | Integer | Port to listen on | `8080` |
-| `server.listen` | Array | IP addresses to bind (IPv4/IPv6) | `["0.0.0.0"]` |
-| `server.auth_key` | String | Bearer token for `/refresh` endpoint | Required |
-| `cdisc.base_url` | String | CDISC Library API base URL | Required |
-| `cdisc.api_key` | String | Your CDISC API key | Required |
-| `valkey.address` | String | Valkey/Redis server address | `localhost:6379` |
-| `valkey.password` | String | Authentication password | Empty |
-| `valkey.db` | Integer | Database number | `0` |
-| `cache.ttl` | String | Cache duration (1y, 30d, 24h, etc.) | `1y` |
+L1 cache does not need to be set persistant because L2 is acting as persistant, long-term, out of RAM, storage.
 
 ---
 
@@ -177,19 +158,6 @@ curl http://localhost:8080/api/mdr/sdtm/products/sdtmig/3-4
 
 # Subsequent requests - served from cache (X-Cache: HIT)
 curl http://localhost:8080/api/mdr/sdtm/products/sdtmig/3-4
-```
-
-### Force Refresh
-
-Update cached data using the authenticated `/refresh` endpoint:
-
-```bash
-curl -X POST http://localhost:8080/refresh \\
-  -H "Authorization: Bearer your-auth-key" \\
-  -H "Content-Type: application/json" \\
-  -d '{
-    "path": "/mdr/sdtm/products/sdtmig/3-4"
-  }'
 ```
 
 **Response:**
@@ -211,7 +179,7 @@ curl http://localhost:8080/health
 ```
 
 **Response:**
-```json
+```text
 {
   "status": "healthy"
 }
@@ -338,7 +306,7 @@ sudo systemctl status cdisc-proxy
 #### Dockerfile
 
 ```dockerfile
-FROM golang:1.21-alpine AS builder
+FROM golang:1.25-alpine AS builder
 
 WORKDIR /build
 COPY . .
@@ -412,7 +380,6 @@ The application logs:
 - Listen addresses
 - Cache hits and misses
 - Upstream API errors
-- Refresh requests
 
 **Example Output:**
 ```
@@ -536,20 +503,6 @@ netstat -tulpn | grep 8080
 ```yaml
 server:
   port: 8081
-```
-
-### Unauthorized Errors
-
-**Verify auth key:**
-```bash
-# Check config
-grep auth_key /etc/conf.d/cdisc-proxy.conf
-
-# Test with correct key
-curl -X POST http://localhost:8080/refresh \\
-  -H "Authorization: Bearer $(grep auth_key /etc/conf.d/cdisc-proxy.conf | cut -d'"' -f2)" \\
-  -H "Content-Type: application/json" \\
-  -d '{"path": "/test"}'
 ```
 
 ---

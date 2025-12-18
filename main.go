@@ -2,145 +2,479 @@ package main
 
 import (
 	"context"
-	"crypto/subtle"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
+	"strconv"
 
+	_ "github.com/duckdb/duckdb-go/v2"
+	"github.com/goccy/go-yaml"
+	_ "github.com/lib/pq"
 	"github.com/valkey-io/valkey-go"
-	"gopkg.in/yaml.v3"
 )
+
+const (
+	maxResponseSize = 100 * 1024 * 1024 // 100MB limit
+	requestTimeout  = 30 * time.Second
+)
+
+// --- Structs for API & Cache ---
 
 type Config struct {
 	Server struct {
-		Port      int      `yaml:"port"`
-		Listen    []string `yaml:"listen"`   // IP addresses to listen on (supports IPv4 and IPv6)
-		AuthKey   string   `yaml:"auth_key"` // API key for protecting the refresh endpoint
+		Port    int      `yaml:"port"`
+		Listen  []string `yaml:"listen"`
+		AuthKey string   `yaml:"auth_key"`
 	} `yaml:"server"`
 	CDISC struct {
 		BaseURL string `yaml:"base_url"`
 		APIKey  string `yaml:"api_key"`
 	} `yaml:"cdisc"`
-	Valkey struct {
-		Address  string `yaml:"address"`
-		Password string `yaml:"password"`
-		DB       int    `yaml:"db"`
-	} `yaml:"valkey"`
 	Cache struct {
-		TTL string `yaml:"ttl"` // Cache duration (e.g., "24h", "7d", "1y")
+		L1 struct {
+			Driver  string `yaml:"driver"`
+			Address string `yaml:"address"`
+			TTL     string `yaml:"ttl"`
+		} `yaml:"l1"`
+		L2 struct {
+			DuckDBPath      string `yaml:"duckdb_path"`
+			PostgresDSN     string `yaml:"postgres_dsn"`
+			TTL             string `yaml:"ttl"`
+			CleanupEnabled  bool   `yaml:"cleanup_enabled"`
+			CleanupInterval string `yaml:"cleanup_interval"`
+		} `yaml:"l2"`
 	} `yaml:"cache"`
+	Scheduler struct {
+		Enabled  bool   `yaml:"enabled"`
+		Interval string `yaml:"interval"`
+	} `yaml:"scheduler"`
 }
 
 type ProxyServer struct {
-	config        Config
-	valkeyClient  valkey.Client
-	httpClient    *http.Client
-	ctx           context.Context
-	cacheTTL      time.Duration
+	config     Config
+	l1Client   valkey.Client
+	l2Db       *sql.DB
+	storage    StorageAdapter
+	httpClient *http.Client
+	l1TTL      time.Duration
+	l2TTL      time.Duration
+	ctx        context.Context
+	cancel     context.CancelFunc
+	wg         sync.WaitGroup
+	mu         sync.RWMutex // Protects concurrent cache operations
 }
 
-func loadConfig(filename string) (*Config, error) {
-	data, err := os.ReadFile(filename)
+// StorageAdapter abstracts DB-specific operations
+type StorageAdapter interface {
+	UpsertCache(key string, data []byte, expiresAt time.Time, group string) error
+	UpsertSystemMeta(key, val string) error
+	UpsertProductMeta(id, ts string) error
+	DeleteByProductGroup(group string) error
+	CleanupExpired() (int64, error)
+}
+
+// --- Storage Implementations ---
+
+type DuckDBAdapter struct {
+	db *sql.DB
+}
+
+func (d *DuckDBAdapter) UpsertCache(key string, data []byte, expiresAt time.Time, group string) error {
+	_, err := d.db.Exec("INSERT OR REPLACE INTO cdisc_cache VALUES ($1, $2, $3, $4)", key, data, expiresAt, group)
+	return err
+}
+
+func (d *DuckDBAdapter) UpsertSystemMeta(key, val string) error {
+	_, err := d.db.Exec("INSERT OR REPLACE INTO system_meta VALUES ($1, $2)", key, val)
+	return err
+}
+
+func (d *DuckDBAdapter) UpsertProductMeta(id, ts string) error {
+	_, err := d.db.Exec("INSERT OR REPLACE INTO product_meta VALUES ($1, $2)", id, ts)
+	return err
+}
+
+func (d *DuckDBAdapter) DeleteByProductGroup(group string) error {
+	_, err := d.db.Exec("DELETE FROM cdisc_cache WHERE product_group = $1", group)
+	return err
+}
+
+func (d *DuckDBAdapter) CleanupExpired() (int64, error) {
+	result, err := d.db.Exec("DELETE FROM cdisc_cache WHERE expires_at < $1", time.Now())
 	if err != nil {
-		return nil, fmt.Errorf("failed to read config file: %w", err)
+		return 0, err
 	}
-
-	var config Config
-	if err := yaml.Unmarshal(data, &config); err != nil {
-		return nil, fmt.Errorf("failed to parse config file: %w", err)
-	}
-
-	return &config, nil
+	return result.RowsAffected()
 }
 
-func parseDuration(ttlStr string) (time.Duration, error) {
-	// Support custom duration formats like "1y" for 1 year, "7d" for 7 days
-	if ttlStr == "" {
-		return 365 * 24 * time.Hour, nil // Default to 1 year
+type PostgresAdapter struct {
+	db *sql.DB
+}
+
+func (p *PostgresAdapter) UpsertCache(key string, data []byte, expiresAt time.Time, group string) error {
+	_, err := p.db.Exec(`
+		INSERT INTO cdisc_cache (key, data, expires_at, product_group) 
+		VALUES ($1, $2, $3, $4) 
+		ON CONFLICT (key) DO UPDATE SET data=$2, expires_at=$3, product_group=$4`,
+		key, data, expiresAt, group)
+	return err
+}
+
+func (p *PostgresAdapter) UpsertSystemMeta(key, val string) error {
+	_, err := p.db.Exec(`
+		INSERT INTO system_meta (key, val) VALUES ($1, $2) 
+		ON CONFLICT (key) DO UPDATE SET val=$2`, key, val)
+	return err
+}
+
+func (p *PostgresAdapter) UpsertProductMeta(id, ts string) error {
+	_, err := p.db.Exec(`
+		INSERT INTO product_meta (product_id, last_update) VALUES ($1, $2) 
+		ON CONFLICT (product_id) DO UPDATE SET last_update=$2`, id, ts)
+	return err
+}
+
+func (p *PostgresAdapter) DeleteByProductGroup(group string) error {
+	_, err := p.db.Exec("DELETE FROM cdisc_cache WHERE product_group = $1", group)
+	return err
+}
+
+func (p *PostgresAdapter) CleanupExpired() (int64, error) {
+	result, err := p.db.Exec("DELETE FROM cdisc_cache WHERE expires_at < $1", time.Now())
+	if err != nil {
+		return 0, err
 	}
-	
-	// Check for custom formats
-	if len(ttlStr) >= 2 {
-		unit := ttlStr[len(ttlStr)-1:]
-		valueStr := ttlStr[:len(ttlStr)-1]
-		
-		var value int
-		if _, err := fmt.Sscanf(valueStr, "%d", &value); err == nil {
-			switch unit {
-			case "y":
-				return time.Duration(value) * 365 * 24 * time.Hour, nil
-			case "d":
-				return time.Duration(value) * 24 * time.Hour, nil
-			case "w":
-				return time.Duration(value) * 7 * 24 * time.Hour, nil
-			}
+	return result.RowsAffected()
+}
+
+func parseTTL(ttl string) (time.Duration, error) {
+    // Handle custom formats first
+    if strings.HasSuffix(ttl, "y") {
+        years, err := strconv.Atoi(strings.TrimSuffix(ttl, "y"))
+        if err != nil {
+            return 0, err
+        }
+        return time.Hour * 24 * 365 * time.Duration(years), nil
+    }
+    if strings.HasSuffix(ttl, "w") {
+        weeks, err := strconv.Atoi(strings.TrimSuffix(ttl, "w"))
+        if err != nil {
+            return 0, err
+        }
+        return time.Hour * 24 * 7 * time.Duration(weeks), nil
+    }
+    if strings.HasSuffix(ttl, "d") {
+        days, err := strconv.Atoi(strings.TrimSuffix(ttl, "d"))
+        if err != nil {
+            return 0, err
+        }
+        return time.Hour * 24 * time.Duration(days), nil
+    }
+
+    // Fall back to Go’s native duration parsing
+    return time.ParseDuration(ttl)
+}
+
+// --- Logic: The Smart Cache Flow ---
+
+func NewProxyServer(ctx context.Context, cfg Config) (*ProxyServer, error) {
+	// Validate config
+	if err := validateConfig(cfg); err != nil {
+		return nil, fmt.Errorf("invalid config: %w", err)
+	}
+
+	// Parse TTLs
+	l1TTL, err := parseTTL(cfg.Cache.L1.TTL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid L1 TTL: %w", err)
+	}
+	l2TTL, err := parseTTL(cfg.Cache.L2.TTL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid L2 TTL: %w", err)
+	}
+
+	// Create cancellable context
+	serverCtx, cancel := context.WithCancel(ctx)
+
+	ps := &ProxyServer{
+		config:     cfg,
+		httpClient: &http.Client{Timeout: requestTimeout},
+		l1TTL:      l1TTL,
+		l2TTL:      l2TTL,
+		ctx:        serverCtx,
+		cancel:     cancel,
+	}
+
+	// Init L1 (Valkey/Dragonfly)
+	l1Client, err := valkey.NewClient(valkey.ClientOption{
+		InitAddress: []string{cfg.Cache.L1.Address},
+	})
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("L1 init failed: %w", err)
+	}
+	ps.l1Client = l1Client
+
+	// Init L2 (DuckDB or Postgres)
+	var db *sql.DB
+	var storage StorageAdapter
+
+	if cfg.Cache.L2.DuckDBPath != "" {
+		db, err = sql.Open("duckdb", cfg.Cache.L2.DuckDBPath)
+		if err != nil {
+			cancel()
+			l1Client.Close()
+			return nil, fmt.Errorf("DuckDB init failed: %w", err)
+		}
+		storage = &DuckDBAdapter{db: db}
+	} else {
+		db, err = sql.Open("postgres", cfg.Cache.L2.PostgresDSN)
+		if err != nil {
+			cancel()
+			l1Client.Close()
+			return nil, fmt.Errorf("Postgres init failed: %w", err)
+		}
+		storage = &PostgresAdapter{db: db}
+	}
+
+	// Test connection
+	if err := db.Ping(); err != nil {
+		cancel()
+		l1Client.Close()
+		db.Close()
+		return nil, fmt.Errorf("L2 connection failed: %w", err)
+	}
+
+	ps.l2Db = db
+	ps.storage = storage
+
+	// Bootstrap Schema
+	if err := ps.initSchema(); err != nil {
+		ps.Close()
+		return nil, fmt.Errorf("schema init failed: %w", err)
+	}
+
+	// Start background tasks
+	if cfg.Scheduler.Enabled {
+		ps.wg.Add(1)
+		go ps.runScheduler()
+	}
+
+	if cfg.Cache.L2.CleanupEnabled {
+		ps.wg.Add(1)
+		go ps.runCleanup()
+	}
+
+	return ps, nil
+}
+
+func validateConfig(cfg Config) error {
+	if cfg.Server.Port <= 0 || cfg.Server.Port > 65535 {
+		return errors.New("invalid server port")
+	}
+	if cfg.Server.AuthKey == "" {
+		return errors.New("auth_key is required")
+	}
+	if cfg.CDISC.BaseURL == "" {
+		return errors.New("CDISC base_url is required")
+	}
+	if cfg.CDISC.APIKey == "" {
+		return errors.New("CDISC api_key is required")
+	}
+	if cfg.Cache.L1.Address == "" {
+		return errors.New("L1 address is required")
+	}
+	if cfg.Cache.L2.DuckDBPath == "" && cfg.Cache.L2.PostgresDSN == "" {
+		return errors.New("either DuckDB path or Postgres DSN is required")
+	}
+	if cfg.Cache.L2.DuckDBPath != "" && cfg.Cache.L2.PostgresDSN != "" {
+		return errors.New("configure either DuckDB or Postgres, not both")
+	}
+	return nil
+}
+
+func (ps *ProxyServer) initSchema() error {
+	schemas := []string{
+		`CREATE TABLE IF NOT EXISTS cdisc_cache (
+			key TEXT PRIMARY KEY, 
+			data BLOB, 
+			expires_at TIMESTAMP, 
+			product_group TEXT
+		)`,
+		`CREATE TABLE IF NOT EXISTS product_meta (
+			product_id TEXT PRIMARY KEY, 
+			last_update TEXT
+		)`,
+		`CREATE TABLE IF NOT EXISTS system_meta (
+			key TEXT PRIMARY KEY, 
+			val TEXT
+		)`,
+	}
+
+	for _, schema := range schemas {
+		if _, err := ps.l2Db.Exec(schema); err != nil {
+			return err
 		}
 	}
-	
-	// Try standard Go duration format (e.g., "24h", "30m")
-	return time.ParseDuration(ttlStr)
+
+	// Create indexes for better performance
+	indexes := []string{
+		`CREATE INDEX IF NOT EXISTS idx_cache_expires ON cdisc_cache(expires_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_cache_product ON cdisc_cache(product_group)`,
+	}
+
+	for _, idx := range indexes {
+		if _, err := ps.l2Db.Exec(idx); err != nil {
+			log.Printf("Warning: index creation failed: %v", err)
+		}
+	}
+
+	return nil
 }
 
-func NewProxyServer(config Config) (*ProxyServer, error) {
-	ctx := context.Background()
+func (ps *ProxyServer) Close() error {
+	ps.cancel()
+	ps.wg.Wait()
 
-	// Parse cache TTL
-	cacheTTL, err := parseDuration(config.Cache.TTL)
-	if err != nil {
-		return nil, fmt.Errorf("invalid cache TTL: %w", err)
+	var errs []error
+	if ps.l1Client != nil {
+		ps.l1Client.Close()
 	}
-	log.Printf("Cache TTL set to: %v", cacheTTL)
-
-	// Initialize Valkey client
-	clientOpts := valkey.ClientOption{
-		InitAddress: []string{config.Valkey.Address},
-	}
-	
-	if config.Valkey.Password != "" {
-		clientOpts.Password = config.Valkey.Password
-	}
-	
-	if config.Valkey.DB != 0 {
-		clientOpts.SelectDB = config.Valkey.DB
+	if ps.l2Db != nil {
+		if err := ps.l2Db.Close(); err != nil {
+			errs = append(errs, err)
+		}
 	}
 
-	valkeyClient, err := valkey.NewClient(clientOpts)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create Valkey client: %w", err)
+	if len(errs) > 0 {
+		return fmt.Errorf("close errors: %v", errs)
 	}
-
-	// Test Valkey connection
-	if err := valkeyClient.Do(ctx, valkeyClient.B().Ping().Build()).Error(); err != nil {
-		valkeyClient.Close()
-		return nil, fmt.Errorf("failed to connect to Valkey: %w", err)
-	}
-
-	return &ProxyServer{
-		config:        config,
-		valkeyClient:  valkeyClient,
-		httpClient:    &http.Client{Timeout: 30 * time.Second},
-		ctx:           ctx,
-		cacheTTL:      cacheTTL,
-	}, nil
+	return nil
 }
 
-func (ps *ProxyServer) getCacheKey(path string) string {
-	return fmt.Sprintf("cdisc:cache:%s", path)
+// Authentication middleware
+func (ps *ProxyServer) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		authHeader := r.Header.Get("Authorization")
+		expectedAuth := "Bearer " + ps.config.Server.AuthKey
+
+		if authHeader != expectedAuth {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		next(w, r)
+	}
+}
+
+// handleProxy implements the Smart Logic
+func (ps *ProxyServer) handleProxy(w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimPrefix(r.URL.Path, "/api")
+
+	// Sanitize path
+	if strings.Contains(path, "..") || !strings.HasPrefix(path, "/") {
+		http.Error(w, "Invalid path", http.StatusBadRequest)
+		return
+	}
+
+	cacheKey := "cdisc:cache:" + path
+	prodGroup := ps.identifyProductGroup(path)
+
+	// 1. L1 [hit] -> reply -> L1 [TTL update]
+	val, err := ps.l1Client.Do(ps.ctx, ps.l1Client.B().Get().Key(cacheKey).Build()).AsBytes()
+	if err == nil {
+		// Asynchronous TTL update so we don't block the response
+		ps.wg.Add(1)
+		go func() {
+			defer ps.wg.Done()
+			ctx, cancel := context.WithTimeout(ps.ctx, 5*time.Second)
+			defer cancel()
+			if err := ps.l1Client.Do(ctx, ps.l1Client.B().Expire().Key(cacheKey).Seconds(int64(ps.l1TTL.Seconds())).Build()).Error(); err != nil {
+				log.Printf("L1 TTL update failed for %s: %v", cacheKey, err)
+			}
+		}()
+
+		w.Header().Set("X-Cache-Tier", "L1-HIT")
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(val)
+		return
+	}
+
+	// 2. L1 [miss] -> L2 [hit] -> reply -> L1 [set]
+	ps.mu.RLock()
+	var data []byte
+	var expiresAt time.Time
+	err = ps.l2Db.QueryRowContext(ps.ctx, "SELECT data, expires_at FROM cdisc_cache WHERE key = $1", cacheKey).Scan(&data, &expiresAt)
+	ps.mu.RUnlock()
+
+	if err == nil && time.Now().Before(expiresAt) {
+		// Promote back to L1
+		ps.wg.Add(1)
+		go func() {
+			defer ps.wg.Done()
+			ctx, cancel := context.WithTimeout(ps.ctx, 5*time.Second)
+			defer cancel()
+			if err := ps.l1Client.Do(ctx, ps.l1Client.B().Set().Key(cacheKey).Value(string(data)).Ex(ps.l1TTL).Build()).Error(); err != nil {
+				log.Printf("L1 promotion failed for %s: %v", cacheKey, err)
+			}
+		}()
+
+		w.Header().Set("X-Cache-Tier", "L2-HIT")
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(data)
+		return
+	}
+
+	// 3. L1 [miss] -> L2 [miss] -> upstream -> reply -> L1 [set] -> L2 [set]
+	respBody, status, err := ps.fetchFromCDISC(path)
+	if err != nil {
+		log.Printf("CDISC API error for %s: %v", path, err)
+		http.Error(w, "CDISC API Error", http.StatusBadGateway)
+		return
+	}
+
+	if status == 200 {
+		// Save to L2 (Persistence)
+		ps.mu.Lock()
+		if err := ps.saveToL2(cacheKey, respBody, prodGroup); err != nil {
+			log.Printf("L2 save failed for %s: %v", cacheKey, err)
+		}
+		ps.mu.Unlock()
+
+		// Save to L1 (RAM) - async
+		ps.wg.Add(1)
+		go func() {
+			defer ps.wg.Done()
+			ctx, cancel := context.WithTimeout(ps.ctx, 5*time.Second)
+			defer cancel()
+			if err := ps.l1Client.Do(ctx, ps.l1Client.B().Set().Key(cacheKey).Value(string(respBody)).Ex(ps.l1TTL).Build()).Error(); err != nil {
+				log.Printf("L1 save failed for %s: %v", cacheKey, err)
+			}
+		}()
+	}
+
+	w.Header().Set("X-Cache-Tier", "MISS")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	w.Write(respBody)
 }
 
 func (ps *ProxyServer) fetchFromCDISC(path string) ([]byte, int, error) {
 	url := ps.config.CDISC.BaseURL + path
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequestWithContext(ps.ctx, "GET", url, nil)
 	if err != nil {
 		return nil, 0, err
 	}
 
-	req.Header.Set("api-key", ps.config.CDISC.APIKey)
+	req.Header.Set("Api-Key", ps.config.CDISC.APIKey)
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := ps.httpClient.Do(req)
@@ -149,247 +483,287 @@ func (ps *ProxyServer) fetchFromCDISC(path string) ([]byte, int, error) {
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	// Limit response size
+	limitedReader := io.LimitReader(resp.Body, maxResponseSize)
+	body, err := io.ReadAll(limitedReader)
 	if err != nil {
-		return nil, resp.StatusCode, err
+		return nil, 0, err
 	}
 
 	return body, resp.StatusCode, nil
 }
 
-func (ps *ProxyServer) cacheResponse(key string, data []byte) error {
-	cmd := ps.valkeyClient.B().Set().Key(key).Value(string(data)).Ex(ps.cacheTTL).Build()
-	return ps.valkeyClient.Do(ps.ctx, cmd).Error()
-}
+// --- Logic: Smart Invalidation Scheduler ---
 
-func (ps *ProxyServer) getFromCache(key string) ([]byte, bool, error) {
-	cmd := ps.valkeyClient.B().Get().Key(key).Build()
-	result := ps.valkeyClient.Do(ps.ctx, cmd)
-	
-	if err := result.Error(); err != nil {
-		// Check if key doesn't exist
-		if valkey.IsValkeyNil(err) {
-			return nil, false, nil
+func (ps *ProxyServer) runScheduler() {
+	defer ps.wg.Done()
+
+	interval, err := time.ParseDuration(ps.config.Scheduler.Interval)
+	if err != nil {
+		log.Printf("Invalid scheduler interval: %v", err)
+		return
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ps.ctx.Done():
+			log.Println("[Scheduler] Shutting down")
+			return
+		case <-ticker.C:
+			log.Println("[Scheduler] Checking CDISC Library for updates...")
+			if err := ps.checkAndSync(); err != nil {
+				log.Printf("[Scheduler] Sync error: %v", err)
+			}
 		}
-		return nil, false, err
 	}
-	
-	data, err := result.AsBytes()
-	if err != nil {
-		return nil, false, err
-	}
-	
-	return data, true, nil
 }
 
-func (ps *ProxyServer) authenticate(r *http.Request) bool {
-	authHeader := r.Header.Get("Authorization")
-	if authHeader == "" {
-		return false
+func (ps *ProxyServer) checkAndSync() error {
+	// 1. Check Global /mdr/lastupdated
+	body, status, err := ps.fetchFromCDISC("/mdr/lastupdated")
+	if err != nil || status != 200 {
+		return fmt.Errorf("failed to fetch last updated: %w", err)
 	}
 
-	// Support "Bearer <token>" format
-	token := strings.TrimPrefix(authHeader, "Bearer ")
-	token = strings.TrimSpace(token)
-
-	// Use constant-time comparison to prevent timing attacks
-	return subtle.ConstantTimeCompare([]byte(token), []byte(ps.config.Server.AuthKey)) == 1
-}
-
-// Regular proxy endpoint - serves from cache or fetches and caches
-func (ps *ProxyServer) handleProxy(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
+	var global struct {
+		LastUpdated string `json:"lastUpdated"`
+	}
+	if err := json.Unmarshal(body, &global); err != nil {
+		return fmt.Errorf("failed to parse last updated: %w", err)
 	}
 
-	// Extract the CDISC API path
-	path := strings.TrimPrefix(r.URL.Path, "/api")
-	if r.URL.RawQuery != "" {
-		path += "?" + r.URL.RawQuery
+	var lastSeen string
+	err = ps.l2Db.QueryRowContext(ps.ctx, "SELECT val FROM system_meta WHERE key = 'global_ts'").Scan(&lastSeen)
+	if err != nil && err != sql.ErrNoRows {
+		return fmt.Errorf("failed to query global_ts: %w", err)
 	}
 
-	cacheKey := ps.getCacheKey(path)
-
-	// Try to get from cache first
-	cachedData, found, err := ps.getFromCache(cacheKey)
-	if err != nil {
-		log.Printf("Cache error: %v", err)
-	}
-
-	if found {
-		log.Printf("Cache hit for: %s", path)
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("X-Cache", "HIT")
-		w.Write(cachedData)
-		return
-	}
-
-	// Cache miss - fetch from CDISC
-	log.Printf("Cache miss for: %s", path)
-	data, statusCode, err := ps.fetchFromCDISC(path)
-	if err != nil {
-		log.Printf("Error fetching from CDISC: %v", err)
-		http.Error(w, "Error fetching from CDISC API", http.StatusBadGateway)
-		return
-	}
-
-	// Cache only successful responses
-	if statusCode == http.StatusOK {
-		if err := ps.cacheResponse(cacheKey, data); err != nil {
-			log.Printf("Error caching response: %v", err)
+	if global.LastUpdated != lastSeen {
+		log.Printf("[Scheduler] Update detected: %s. Syncing products...", global.LastUpdated)
+		if err := ps.syncAndInvalidateProducts(global.LastUpdated); err != nil {
+			return err
 		}
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("X-Cache", "MISS")
-	w.WriteHeader(statusCode)
-	w.Write(data)
+	return nil
 }
 
-// Refresh endpoint - forces fetch from CDISC and updates cache
-func (ps *ProxyServer) handleRefresh(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
+func (ps *ProxyServer) syncAndInvalidateProducts(newGlobalTs string) error {
+	body, status, err := ps.fetchFromCDISC("/mdr/products")
+	if err != nil || status != 200 {
+		return fmt.Errorf("failed to fetch products: %w", err)
 	}
 
-	// Check authentication
-	if !ps.authenticate(r) {
-		w.Header().Set("WWW-Authenticate", `Bearer realm="CDISC Proxy"`)
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
+	var catalog struct {
+		Products []struct {
+			ID          string `json:"id"`
+			LastUpdated string `json:"lastUpdated"`
+		} `json:"products"`
+	}
+	if err := json.Unmarshal(body, &catalog); err != nil {
+		return fmt.Errorf("failed to parse products: %w", err)
 	}
 
-	// Get path from request body
-	var request struct {
-		Path string `json:"path"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
-		return
-	}
+	for _, p := range catalog.Products {
+		var localTs string
+		err := ps.l2Db.QueryRowContext(ps.ctx, "SELECT last_update FROM product_meta WHERE product_id = $1", p.ID).Scan(&localTs)
+		if err != nil && err != sql.ErrNoRows {
+			log.Printf("[Scheduler] Error checking product %s: %v", p.ID, err)
+			continue
+		}
 
-	if request.Path == "" {
-		http.Error(w, "Path is required", http.StatusBadRequest)
-		return
-	}
+		if p.LastUpdated != localTs {
+			log.Printf("[Scheduler] Invalidating out-of-date product: %s", p.ID)
 
-	log.Printf("Refresh requested for: %s", request.Path)
+			// SQL Invalidation
+			ps.mu.Lock()
+			if err := ps.storage.DeleteByProductGroup(strings.ToLower(p.ID)); err != nil {
+				log.Printf("[Scheduler] L2 invalidation failed for %s: %v", p.ID, err)
+			}
+			ps.mu.Unlock()
 
-	// Fetch from CDISC
-	data, statusCode, err := ps.fetchFromCDISC(request.Path)
-	if err != nil {
-		log.Printf("Error fetching from CDISC: %v", err)
-		http.Error(w, "Error fetching from CDISC API", http.StatusBadGateway)
-		return
-	}
+			// Smart L1 Invalidation
+			if err := ps.invalidateL1ByPrefix("cdisc:cache:/mdr/" + strings.ToLower(p.ID)); err != nil {
+				log.Printf("[Scheduler] L1 invalidation failed for %s: %v", p.ID, err)
+			}
 
-	// Always cache the response, regardless of whether it existed before
-	cacheKey := ps.getCacheKey(request.Path)
-	if statusCode == http.StatusOK {
-		if err := ps.cacheResponse(cacheKey, data); err != nil {
-			log.Printf("Error caching response: %v", err)
+			// Update Metadata
+			if err := ps.storage.UpsertProductMeta(p.ID, p.LastUpdated); err != nil {
+				log.Printf("[Scheduler] Product meta update failed for %s: %v", p.ID, err)
+			}
 		}
 	}
 
-	response := map[string]interface{}{
-		"status":       "success",
-		"cached":       statusCode == http.StatusOK,
-		"status_code":  statusCode,
-		"content_size": len(data),
+	if err := ps.storage.UpsertSystemMeta("global_ts", newGlobalTs); err != nil {
+		return fmt.Errorf("failed to update global_ts: %w", err)
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	return nil
 }
 
-// Health check endpoint
-func (ps *ProxyServer) handleHealth(w http.ResponseWriter, r *http.Request) {
-	// Check Valkey connection
-	cmd := ps.valkeyClient.B().Ping().Build()
-	if err := ps.valkeyClient.Do(ps.ctx, cmd).Error(); err != nil {
-		w.WriteHeader(http.StatusServiceUnavailable)
-		json.NewEncoder(w).Encode(map[string]string{
-			"status": "unhealthy",
-			"error":  "Valkey connection failed",
-		})
-		return
+func (ps *ProxyServer) invalidateL1ByPrefix(prefix string) error {
+	// For Dragonfly, we use larger batch sizes to leverage its multi-threaded DEL
+	batchSize := 100
+	if ps.config.Cache.L1.Driver == "dragonfly" {
+		batchSize = 1000
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"status": "healthy",
-	})
+	var cursor uint64
+	for {
+		select {
+		case <-ps.ctx.Done():
+			return ps.ctx.Err()
+		default:
+		}
+
+		res, err := ps.l1Client.Do(
+			ps.ctx,
+			ps.l1Client.B().
+				Scan().
+				Cursor(cursor).
+				Match(prefix + "*").
+				Count(int64(batchSize)).
+				Build(),
+		).AsScanEntry()
+		if err != nil {
+			return fmt.Errorf("scan failed: %w", err)
+		}
+
+		if len(res.Elements) == 0 {
+			break
+		}
+
+		var delErr error
+		if ps.config.Cache.L1.Driver == "dragonfly" {
+			delErr = ps.l1Client.Do(
+				ps.ctx,
+				ps.l1Client.B().Del().Key(res.Elements...).Build(),
+			).Error()
+		} else {
+			delErr = ps.l1Client.Do(
+				ps.ctx,
+				ps.l1Client.B().Unlink().Key(res.Elements...).Build(),
+			).Error()
+		}
+
+		if delErr != nil {
+			return fmt.Errorf("delete failed: %w", delErr)
+		}
+
+		cursor = res.Cursor
+		if cursor == 0 {
+			break
+		}
+	}
+
+	return nil
 }
 
-func (ps *ProxyServer) Close() {
-	ps.valkeyClient.Close()
+// --- L2 Cleanup Job ---
+
+func (ps *ProxyServer) runCleanup() {
+	defer ps.wg.Done()
+
+	interval, err := time.ParseDuration(ps.config.Cache.L2.CleanupInterval)
+	if err != nil {
+		log.Printf("Invalid cleanup interval, using default 1h: %v", err)
+		interval = time.Hour
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ps.ctx.Done():
+			log.Println("[Cleanup] Shutting down")
+			return
+		case <-ticker.C:
+			log.Println("[Cleanup] Running expired entry cleanup...")
+			ps.mu.Lock()
+			count, err := ps.storage.CleanupExpired()
+			ps.mu.Unlock()
+
+			if err != nil {
+				log.Printf("[Cleanup] Error: %v", err)
+			} else {
+				log.Printf("[Cleanup] Removed %d expired entries", count)
+			}
+		}
+	}
+}
+
+// --- Helpers: DB, Config, and Extraction ---
+
+func (ps *ProxyServer) identifyProductGroup(path string) string {
+	parts := strings.Split(strings.TrimPrefix(path, "/mdr/"), "/")
+	if len(parts) > 0 {
+		return strings.ToLower(parts[0])
+	}
+	return "misc"
+}
+
+func (ps *ProxyServer) saveToL2(key string, data []byte, group string) error {
+	expiry := time.Now().Add(ps.l2TTL)
+	return ps.storage.UpsertCache(key, data, expiry, group)
 }
 
 func main() {
-	// Determine config file path
-	var configFile string
-	
+	cfgFile := "config.yaml"
 	if len(os.Args) > 1 {
-		// Command line argument takes precedence
-		configFile = os.Args[1]
-	} else {
-		// Default to /etc/conf.d/cdisc-proxy.conf
-		configFile = "/etc/conf.d/cdisc-proxy.conf"
+		cfgFile = os.Args[1]
 	}
 
-	log.Printf("Loading configuration from: %s", configFile)
-	config, err := loadConfig(configFile)
+	data, err := os.ReadFile(cfgFile)
 	if err != nil {
-		log.Fatalf("Failed to load config: %v", err)
+		log.Fatalf("Failed to read config: %v", err)
 	}
 
-	server, err := NewProxyServer(*config)
+	var cfg Config
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		log.Fatalf("Failed to parse config: %v", err)
+	}
+
+	ctx := context.Background()
+	server, err := NewProxyServer(ctx, cfg)
 	if err != nil {
-		log.Fatalf("Failed to initialize server: %v", err)
+		log.Fatalf("Failed to create server: %v", err)
 	}
 	defer server.Close()
 
+	// Setup routes with auth middleware
+	// http.HandleFunc("/api/", server.authMiddleware(server.handleProxy))
+
+	// Setup routes without auth middleware
 	http.HandleFunc("/api/", server.handleProxy)
-	http.HandleFunc("/refresh", server.handleRefresh)
-	http.HandleFunc("/health", server.handleHealth)
 
-	// Default to listening on all interfaces if no listen addresses specified
-	listenAddrs := config.Server.Listen
+	// Health check endpoint (no auth required)
+	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"status":"healthy"}`))
+	})
+
+
+	
+	// --- Multi-interface binding ---
+	listenAddrs := cfg.Server.Listen
 	if len(listenAddrs) == 0 {
-		listenAddrs = []string{"0.0.0.0"}
+		 listenAddrs = []string{"0.0.0.0"} // default 
 	}
-
-	log.Printf("Starting CDISC Library API Proxy on port %d", config.Server.Port)
-	log.Printf("Listening on: %v", listenAddrs)
-	log.Printf("Proxy endpoint: /api/*")
-	log.Printf("Refresh endpoint: POST /refresh (requires authentication)")
-	log.Printf("Health check: /health")
-
-	// Channel to collect errors from multiple listeners
-	errChan := make(chan error, len(listenAddrs))
-
-	// Start HTTP server on each specified listen address
+	
 	for _, addr := range listenAddrs {
-		var listenAddr string
-		
-		// IPv6 addresses need to be wrapped in brackets
-		if strings.Contains(addr, ":") {
-			listenAddr = fmt.Sprintf("[%s]:%d", addr, config.Server.Port)
-		} else {
-			listenAddr = fmt.Sprintf("%s:%d", addr, config.Server.Port)
-		}
-		
-		go func(address string) {
-			log.Printf("Starting listener on %s", address)
-			if err := http.ListenAndServe(address, nil); err != nil {
-				errChan <- fmt.Errorf("listener %s failed: %w", address, err)
+		go func(addr string) {
+			bind := fmt.Sprintf("%s:%d", addr, cfg.Server.Port)
+			log.Printf("Starting server on %s", bind)
+			if err := http.ListenAndServe(bind, nil); err != nil {
+				log.Fatalf("Server failed on %s: %v", bind, err)
 			}
-		}(listenAddr)
+		}(addr)
 	}
-
-	// Wait for any listener to fail
-	err = <-errChan
-	log.Fatalf("Server failed: %v", err)
+	
+	// Block forever select {}
+	select {}
 }

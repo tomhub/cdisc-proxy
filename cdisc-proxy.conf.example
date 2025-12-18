@@ -19,15 +19,38 @@ cdisc:
   # Your CDISC Library API key
   api_key: "your-cdisc-api-key-here"
 
-valkey:
-  address: "localhost:6379"
-  password: ""  # Leave empty if no password
-  db: 0         # Default database
+
+# Cache time-to-live (TTL) - how long to keep cached responses
+# Supports multiple formats:
+#   - Go duration format: "24h", "30m", "168h"
+#   - Custom formats: "1y" (year), "7d" (days), "2w" (weeks)
 
 cache:
-  # Cache time-to-live (TTL) - how long to keep cached responses
-  # Supports multiple formats:
-  #   - Go duration format: "24h", "30m", "168h"
-  #   - Custom formats: "1y" (year), "7d" (days), "2w" (weeks)
-  # Default: "1y" (1 year)
-  ttl: "1y"
+  # L1 cache: in memory cache for recent, hot data
+  l1:
+      driver: "dragonfly"    # valkey, redis, or dragonfly
+      address: "localhost:6379"
+      # L1 TTL - Hot cache duration
+      ttl: "2h" # let it live longer if available RAM is high
+
+  # L2 cache: persistant cache for 'warm' data, but not to keep it in memory
+  l2:
+      # Set ONLY one of these. The program will error if both are provided.
+      # DuckDB, nothing to configure externally, except the path here:
+      duckdb_path: "/var/lib/cdisc-proxy/cdisc_cache.db" # default path
+
+      # if duckdb is too slow, consider PostgreSQL instead, but performance not tested.
+      # postgres_dsn: "postgres://user:pass@localhost:5432/cdisc?sslmode=disable"
+
+      #L2 TTL 
+      ttl: "1y"           # Persistent cache duration
+      # cleaning up L2 (if needed)
+      cleanup_enabled: true
+      cleanup_interval: "240h"
+
+# control scheduler - how often to check /mdr/lastupdated; for devel
+# set to longer interval, like 12w or even more, but do not abuse upstream
+# with small value here, the api reply is not changing so often.
+scheduler:
+  enabled: true
+  interval: "1w"        # How often to check /mdr/lastupdated
