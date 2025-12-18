@@ -496,14 +496,21 @@ func (ps *ProxyServer) handleProxy(w http.ResponseWriter, r *http.Request) {
 		if err := json.Unmarshal(val, &cached); err == nil {
 			// Successfully parsed cached response with status
 			ps.wg.Add(1)
+			// go func() {
+			// 	defer ps.wg.Done()
+			// 	ctx, cancel := context.WithTimeout(ps.ctx, 5*time.Second)
+			// 	defer cancel()
+			// 	if err := ps.l1Client.Do(ctx,
+			// 		ps.l1Client.B().Expire().Key(cacheKey).Seconds(int64(ps.l1TTL.Seconds())).Build()).Error(); err != nil {
+			// 		log.Printf("L1 TTL update failed for %s: %v", cacheKey, err)
+			// 	}
+			// }()
 			go func() {
 				defer ps.wg.Done()
-				ctx, cancel := context.WithTimeout(ps.ctx, 5*time.Second)
-				defer cancel()
-				if err := ps.l1Client.Do(ctx,
-					ps.l1Client.B().Expire().Key(cacheKey).Seconds(int64(ps.l1TTL.Seconds())).Build()).Error(); err != nil {
-					log.Printf("L1 TTL update failed for %s: %v", cacheKey, err)
-				}
+				// Use the server’s main context without a timeout
+				_ = ps.l1Client.Do(ps.ctx,
+					ps.l1Client.B().Expire().Key(cacheKey).Seconds(int64(ps.l1TTL.Seconds())).Build()).Error()
+				// Ignore errors — best effort
 			}()
 
 			w.Header().Set("X-Cache-Tier", "L1-HIT")
