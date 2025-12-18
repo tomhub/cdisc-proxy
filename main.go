@@ -269,37 +269,39 @@ func NewProxyServer(ctx context.Context, cfg Config) (*ProxyServer, error) {
 	ps.l1Client = l1Client
 
 	// Init L2 (BadgerDB or Postgres)
-	var db *sql.DB
-	var storage StorageAdapter
+	var sqlDB *sql.DB
+ 	var storage StorageAdapter
+
 	if cfg.Cache.L2.BadgerPath != "" {
 		opts := badger.DefaultOptions(cfg.Cache.L2.BadgerPath).WithLogger(nil)
-		db, err := badger.Open(opts)
+		badgerDB, err := badger.Open(opts)
 		if err != nil {
 			cancel()
 			l1Client.Close()
 			return nil, fmt.Errorf("Badger init failed: %w", err)
 		}
-	    storage = &BadgerAdapter{db: db}
+		storage = &BadgerAdapter{db: badgerDB}
 	} else {
-		db, err = sql.Open("postgres", cfg.Cache.L2.PostgresDSN)
+		sqlDB, err = sql.Open("postgres", cfg.Cache.L2.PostgresDSN)
 		if err != nil {
 			cancel()
 			l1Client.Close()
 			return nil, fmt.Errorf("Postgres init failed: %w", err)
 		}
-		storage = &PostgresAdapter{db: db}
+		storage = &PostgresAdapter{db: sqlDB}
+
+		// Test connection only for Postgres
+		if err := sqlDB.Ping(); err != nil {
+			cancel()
+			l1Client.Close()
+			sqlDB.Close()
+			return nil, fmt.Errorf("L2 connection failed: %w", err)
+		}
 	}
 
-	// Test connection
-	if err := db.Ping(); err != nil {
-		cancel()
-		l1Client.Close()
-		db.Close()
-		return nil, fmt.Errorf("L2 connection failed: %w", err)
-	}
-
-	ps.l2Db = db
+	ps.l2Db = sqlDB   // will be nil if using Badger
 	ps.storage = storage
+
 
 	// Start background tasks
 	if cfg.Scheduler.Enabled {
@@ -714,7 +716,7 @@ func (ps *ProxyServer) saveToL2(key string, data []byte, group string) error {
 
 func main() {
 	cfgFile := "/etc/conf.d/cdisc-proxy.conf"
-	
+
 	if len(os.Args) > 1 {
 		cfgFile = os.Args[1]
 	}
