@@ -1,567 +1,182 @@
-# CDISC Library API Proxy
+# 🚀 CDISC Library API Proxy
 
-<div align="center">
-
-![Go Version](https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat&logo=go)
-![License](https://img.shields.io/badge/license-MIT-blue.svg)
-![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Alpine-lightgrey)
-
-A high-performance caching proxy server for the [CDISC Library API](https://www.cdisc.org/cdisc-library) with in-memory L1 caching (Valkey/Redis/Dragonfly) and persistent L2 storage (DuckDB or PostgreSQL).
-
-[Features](#features) • [Quick Start](#quick-start) • [Configuration](#configuration) • [API Usage](#api-usage) • [Deployment](#deployment)
-
-</div>
+> A fast, **extremely opinionated**, mildly unhinged (by design) caching proxy for the **CDISC Library API**.
+>
+> Built in Go. Tuned for production. Designed to survive real-world CDISC outages without flapping, stampeding, or waking you up at 03:00 because *someone reran the pipeline*.
+>
+> Yes, it caches errors.  
+> No, that’s not a bug.  
+> Yes, we’ve thought about it more than you have.
 
 ---
 
-## 📋 Table of Contents
+## 😈 What This Thing Does (And Why You’re Already Late to the Party)
 
-- [Features](#features)
-- [Why Use This Proxy?](#why-use-this-proxy)
-- [Prerequisites](#prerequisites)
-- [Quick Start](#quick-start)
-- [Configuration](#configuration)
-- [API Usage](#api-usage)
-- [Cache Management](#cache-management)
-- [Deployment](#deployment)
-  - [Alpine Linux (OpenRC)](#alpine-linux-openrc)
-  - [Systemd](#systemd)
-  - [Docker](#docker)
-- [Monitoring](#monitoring)
-- [Security](#security)
-- [Troubleshooting](#troubleshooting)
-- [Contributing](#contributing)
-- [License](#license)
+Let’s establish some uncomfortable truths[citation required]:
 
----
+- You do **not** control the CDISC Library API  
+- It will be slow, eventually  
+- It will be down, occasionally  
+- Your pipelines will react like toddlers on espresso  
 
-## ✨ Features
+So this proxy exists to sit in the middle, arms crossed, and say:
 
-- 🚀 **High Performance** - Built with Go for speed and efficiency
-- 💾 **Persistent Caching** - Stores responses in Valkey/Redis and DuckDB with configurable TTL 
-- 🌐 **Multi-Interface Support** - Listen on multiple IPv4/IPv6 addresses simultaneously
-- 🔒 **Secure** - Bearer token authentication for sensitive operations
-- 📊 **Health Checks** - Built-in health monitoring endpoint
-- ⚙️ **Configurable** - External YAML configuration for all settings
-- 📝 **Detailed Logging** - Track cache hits/misses and errors
-- 🐧 **Alpine Linux Ready** - Includes OpenRC service files
+> “Absolutely not. You will not all panic at once.”
+
+### In one breath (because you’re busy):
+
+- **Always caches** (even non-200 responses, briefly, on purpose)
+- **Two-tier cache**
+  - ⚡ L1 RAM cache (Valkey / Redis / Dragonfly)
+  - 🗄️ L2 persistent cache (BadgerDB or PostgreSQL)
+- **Singleflight deduplication** — one upstream call, everyone else waits
+- **Streaming leader / cached followers**
+- **Namespace-aware invalidation** via `/mdr/lastupdated`
+- **Health checks that don’t scream** because CDISC sneezed
+
+If you’ve ever watched a CI pipeline accidentally DDoS CDISC…  
+congratulations, this proxy is your emotional support mammal.
 
 ---
 
-## 🤔 Why Use This Proxy?
+## 🧠 Big Picture (AKA “Where the Panic Is Contained”)
 
-### The CDISC Library API provides valuable metadata about clinical trial data standards, but:
+```
+Client
+  │
+  ▼
+🧠 CDISC Proxy (this repo)
+  │
+  ├─ ⚡ L1 Cache (Valkey / Redis / Dragonfly)
+  │    └─ tiny, hot, easily offended
+  │
+  ├─ 🦡 L2 Cache (BadgerDB or PostgreSQL)
+  │    └─ durable, grumpy, hoards metadata forever
+  │
+  └─ 🌐 CDISC Library API
+       └─ singleflight protected (no stampedes, riots, or regrets)
+```
 
-- **Rate Limiting** - Direct API calls may be rate-limited
-- **Performance** - Reduce latency by caching frequently accessed resources
-- **Reliability** - Continue serving cached data even if the upstream API is temporarily unavailable
-- **Cost Efficiency** - Minimize API calls to stay within usage limits
-- **Offline Development** - Work with cached CDISC metadata without constant internet connectivity
-
-### Key 'Smart' Features:
-- **Driver-Specific Invalidation:** The invalidateL1ByPrefix function detects Dragonfly and increases the SCAN count to 1000. Dragonfly’s multi-threaded DEL handles these massive batches across CPU cores, whereas it uses UNLINK for Valkey to avoid blocking the single-threaded event loop.
-
-- **Hierarchical Sync:** The scheduler maintains local metadata tables (product_meta) in your L2 database. It only purges cache entries for products that the CDISC API confirms have a new lastUpdated timestamp.
-
-- **L1 Promotion:** Any L1 miss that results in an L2 hit automatically "warms" the L1 tier again. This keeps your high-memory RAM tier focused on the data your team is actually requesting.
-
-- **Environment Reconstruction:** Because your L2 is persistent (DuckDB file or Postgres), the environment can be fully reconstructed. If L1 is wiped, the proxy seamlessly repopulates it from L2 without overloading the CDISC Library API.
----
-
-## 📦 Prerequisites
-
-- **Go** 1.25 or later
-- **Valkey** or **Redis** or **DragonflyDB** server
-- **CDISC Library API Key** - [Get one here](https://www.cdisc.org/cdisc-library)
+Think of this as a shock absorber.  
+Or a bouncer.  
+Or a racoon guarding a dumpster full of cached metadata.
 
 ---
 
-## 🚀 Quick Start
+## 🏎️ The Life of a Request (No Fairy Tales)
 
-### 1. Clone the Repository
+1. **L1 lookup** — hit? instant response.
+2. **L2 lookup** — hit? served from disk. Small enough? Copy self to L1.
+3. **Upstream call (singleflight)** — one request, many followers.
 
-```bash
-git clone https://github.com/tomhub/cdisc-proxy.git
-cd cdisc-proxy
-```
-
-### 2. Install Dependencies
-
-```bash
-go mod tidy
-```
-
-### 3. Build
-
-```bash
-go build -o cdisc-proxy main.go
-```
-
-### 4. Configure
-
-```bash
-# Create config directory
-sudo mkdir -p /etc/conf.d
-
-# Copy and edit configuration
-cp cdisc-proxy.conf.example /etc/conf.d/cdisc-proxy.conf
-nano /etc/conf.d/cdisc-proxy.conf 
-```
-
-**Required Configuration:**
-- Add your CDISC API key
-- Generate an auth key: `openssl rand -hex 32`
-- Configure Valkey/Redis connection
-
-### 5. Run
-
-```bash
-./cdisc-proxy
-```
-
-Or specify a custom config:
-
-```bash
-./cdisc-proxy /path/to/config.yaml
-```
+No thundering herds.  
+No duplicate CDISC calls.  
+No surprise retrospectives.
 
 ---
 
-## ⚙️ Configuration
+## 🧊 Cache Keys (Yes, We Thought About This)
 
-The proxy uses a YAML configuration file located at `/etc/conf.d/cdisc-proxy.conf` by default.
-
-[Example Configuration](/cdisc.proxy.conf.example)
-
-Configure L1 and L2 caches, L1 will be in memory, L2 for long-term, persistant storage.
-A request will go to:
-  L1 [hit] -> reply -> L1 [TTL update]
-  L1 [miss] -> L2 [hit] -> reply -> L1 [set]
-  L1 [miss] -> L2 [miss] -> upstream -> reply -> L1 [set] -> L2 [set]
-
-Scheduled invalidation
-  - **Scheduler** [Detects Update] -> Delete from L1 -> Delete from L2
-
-L1 cache does not need to be set persistant because L2 is acting as persistant, long-term, out of RAM, storage.
-
----
-
-## 🔌 API Usage
-
-### Regular Proxy Requests
-
-Route requests through `/api/*` to access the CDISC Library API with automatic caching.
-
-```bash
-# First request - fetches from CDISC and caches (X-Cache: MISS)
-curl http://localhost:8080/api/mdr/sdtm/products/sdtmig/3-4
-
-# Subsequent requests - served from cache (X-Cache: HIT)
-curl http://localhost:8080/api/mdr/sdtm/products/sdtmig/3-4
+```
+cdisc:cache:<namespace>:<request-uri>
 ```
 
-**Response:**
+Status codes survive caching:
+
 ```json
-{
-  "status": "success",
-  "cached": true,
-  "status_code": 200,
-  "content_size": 12345
-}
+{ "s": 404, "b": "{ \"error\": \"Not Found\" }" }
 ```
 
-### Health Check
-
-Monitor service health:
-
-```bash
-curl http://localhost:8080/health
-```
-
-**Response:**
-```text
-{
-  "status": "healthy"
-}
-```
+No fake 200s. No lies.
 
 ---
 
-## 💾 Cache Management
+## 😈 Negative Caching
 
-### Cache Keys
+Non-200 responses are cached for 5 minutes:
 
-Cached responses are stored with the format: `cdisc:cache:<path>`
-
-### Manual Cache Operations
-
-```bash
-# Connect to Valkey/Redis
-redis-cli
-
-# List all cached keys
-KEYS cdisc:cache:*
-
-# View cached response
-GET "cdisc:cache:/mdr/sdtm/products/sdtmig/3-4"
-
-# Delete specific cache entry
-DEL "cdisc:cache:/mdr/sdtm/products/sdtmig/3-4"
-
-# Clear all cached data
-KEYS cdisc:cache:* | xargs redis-cli DEL
+```go
+negativeCacheTTL = 5 * time.Minute
 ```
 
-### TTL Management
-
-Configure cache duration in `config.yaml`:
-
-```yaml
-cache:
-  ttl: "30d"  # Cache for 30 days
-```
-
-Supported formats:
-- **Years**: `1y`, `2y`
-- **Weeks**: `1w`, `4w`
-- **Days**: `7d`, `30d`, `365d`
-- **Hours**: `24h`, `168h`
-- **Go duration**: Any valid Go duration string
+Outages become boring.  
+Boring is good.
 
 ---
 
-## 🚀 Deployment
+## 🧭 Namespace-Aware Invalidation
 
-### Alpine Linux (OpenRC)
+Uses `/mdr/lastupdated`.
 
-#### Installation
-
-```bash
-# Create user
-adduser -D -s /sbin/nologin -h /var/lib/cdisc-proxy cdisc
-
-# Install binary
-install -m 755 cdisc-proxy /usr/local/bin/
-
-# Configure
-install -m 640 -o root -g cdisc config.yaml /etc/conf.d/cdisc-proxy.conf
-
-# Install service
-install -m 755 cdisc-proxy.initd /etc/init.d/cdisc-proxy
-
-# Create log directory
-mkdir -p /var/log/cdisc-proxy
-chown cdisc:cdisc /var/log/cdisc-proxy
-```
-
-#### Service Management
-
-```bash
-# Enable on boot
-rc-update add cdisc-proxy default
-
-# Start service
-rc-service cdisc-proxy start
-
-# View logs
-tail -f /var/log/cdisc-proxy/output.log
-```
-
-### Systemd
-
-#### Service File
-
-Create `/etc/systemd/system/cdisc-proxy.service`:
-
-```ini
-[Unit]
-Description=CDISC Library API Proxy
-After=network.target valkey.service
-
-[Service]
-Type=simple
-User=cdisc
-Group=cdisc
-ExecStart=/usr/local/bin/cdisc-proxy
-Restart=on-failure
-RestartSec=5s
-
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-```
-
-#### Enable and Start
-
-```bash
-sudo systemctl enable cdisc-proxy
-sudo systemctl start cdisc-proxy
-sudo systemctl status cdisc-proxy
-```
-
-### Docker
-
-#### Dockerfile
-
-```dockerfile
-FROM golang:1.25-alpine AS builder
-
-WORKDIR /build
-COPY . .
-
-RUN go mod download && \\
-    go build -o cdisc-proxy main.go
-
-FROM alpine:latest
-
-RUN apk --no-cache add ca-certificates && \\
-    adduser -D -s /sbin/nologin cdisc
-
-WORKDIR /app
-COPY --from=builder /build/cdisc-proxy .
-
-USER cdisc
-EXPOSE 8080
-
-CMD ["./cdisc-proxy"]
-```
-
-#### Build and Run
-
-```bash
-# Build image
-docker build -t cdisc-proxy .
-
-# Run container
-docker run -d \\
-  --name cdisc-proxy \\
-  -p 8080:8080 \\
-  -v $(pwd)/config.yaml:/etc/conf.d/cdisc-proxy.conf:ro \\
-  cdisc-proxy
-```
-
-#### Docker Compose
-
-```yaml
-version: '3.8'
-
-services:
-  cdisc-proxy:
-    build: .
-    ports:
-      - "8080:8080"
-    volumes:
-      - ./config.yaml:/etc/conf.d/cdisc-proxy.conf:ro
-    depends_on:
-      - valkey
-    restart: unless-stopped
-
-  valkey:
-    image: valkey/valkey:latest
-    volumes:
-      - valkey-data:/data
-    restart: unless-stopped
-
-volumes:
-  valkey-data:
-```
+Flush only what changed.  
+Not the universe.
 
 ---
 
-## 📊 Monitoring
+## 🤡 Why Not Just Use NGINX?
 
-### Logs
+You can.
 
-The application logs:
-- Configuration loading
-- Cache TTL settings
-- Listen addresses
-- Cache hits and misses
-- Upstream API errors
+NGINX is a **dumb fridge**.  
+This proxy is a **judgmental racoon**.
 
-**Example Output:**
-```
-2025/11/16 10:00:00 Loading configuration from: /etc/conf.d/cdisc-proxy.conf
-2025/11/16 10:00:00 Cache TTL set to: 8760h0m0s
-2025/11/16 10:00:00 Starting CDISC Library API Proxy on port 8080
-2025/11/16 10:00:00 Listening on: [0.0.0.0 ::]
-2025/11/16 10:00:00 Starting listener on 0.0.0.0:8080
-2025/11/16 10:00:00 Starting listener on [::]:8080
-2025/11/16 10:00:05 Cache miss for: /mdr/sdtm/products/sdtmig/3-4
-2025/11/16 10:00:06 Cache hit for: /mdr/sdtm/products/sdtmig/3-4
-```
-
-### Metrics
-
-Monitor these key metrics:
-- **Cache hit rate** - Higher is better
-- **Response time** - Should be <50ms for cache hits
-- **Valkey connection status** - Check `/health` endpoint
-- **Upstream API errors** - Watch error logs
+NGINX can’t:
+- Deduplicate upstream calls
+- Invalidate by CDISC namespace
+- Avoid stampedes
+- Understand CDISC semantics
 
 ---
 
-## 🔒 Security
+## 🤡 Why Not Varnish?
 
-### Best Practices
+Varnish is excellent at:
+- Being fast
+- Being stateless
+- Being *your problem at 02:00*
 
-1. **Protect Auth Key**
-   ```bash
-   # Generate strong key
-   openssl rand -hex 32
-   
-   # Secure config file
-   chmod 640 /etc/conf.d/cdisc-proxy.conf
-   chown root:cdisc /etc/conf.d/cdisc-proxy.conf
-   ```
-
-2. **Use HTTPS in Production**
-   - Run behind nginx or Caddy with SSL/TLS
-   - Never expose directly to the internet
-
-3. **Firewall Configuration**
-   ```bash
-   # Allow only specific IPs
-   iptables -A INPUT -p tcp --dport 8080 -s 192.168.1.0/24 -j ACCEPT
-   iptables -A INPUT -p tcp --dport 8080 -j DROP
-   ```
-
-4. **Network Isolation**
-   ```yaml
-   server:
-     listen:
-       - "127.0.0.1"  # Localhost only
-       - "::1"
-   ```
-
-5. **Regular Updates**
-   - Keep Go and dependencies up to date
-   - Monitor security advisories
-   - Rotate API keys periodically
+It still:
+- Has no idea what SDTM is
+- Can’t read `/mdr/lastupdated`
+- Will happily serve stale-but-fast lies
+- Requires ritual VCL sacrifices
 
 ---
 
-## 🔧 Troubleshooting
+## 📖 A True Story (Postmortem Edition, LLM Hallucination) [not true story]
 
-### Service Won't Start
+**02:17 UTC**  
+CDISC slows down.
 
-**Check configuration:**
-```bash
-./cdisc-proxy /etc/conf.d/cdisc-proxy.conf
-```
+**02:18 UTC**  
+CI pipelines notice.
 
-**Verify permissions:**
-```bash
-ls -la /etc/conf.d/cdisc-proxy.conf
-# Should be readable by cdisc user
-```
+**02:19 UTC**  
+400 identical requests hit `/mdr/sdtm`.
 
-### Valkey Connection Failed
+**02:20 UTC**  
+NGINX shrugs.
 
-**Test connection:**
-```bash
-redis-cli -h localhost -p 6379 ping
-```
+**02:21 UTC**  
+CDISC rate-limits you.
 
-**Check if Valkey is running:**
-```bash
-# Alpine/OpenRC
-rc-service valkey status
+**02:22 UTC**  
+Slack explodes.
 
-# Systemd
-systemctl status valkey
-```
-
-### Cache Not Working
-
-**Verify cache operations:**
-```bash
-# Check if keys are being created
-redis-cli KEYS "cdisc:cache:*"
-
-# Monitor cache activity
-redis-cli MONITOR
-```
-
-**Check TTL:**
-```bash
-redis-cli TTL "cdisc:cache:/your/path"
-```
-
-### Port Already in Use
-
-**Find process using port:**
-```bash
-lsof -i :8080
-# or
-netstat -tulpn | grep 8080
-```
-
-**Use different port:**
-```yaml
-server:
-  port: 8081
-```
+With this proxy:
+- First request goes out
+- Others wait
+- Cache fills
+- Everyone goes back to sleep
 
 ---
 
-## 🤝 Contributing
+## 📜 License
 
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-### Development Setup
-
-```bash
-# Clone repository
-git clone https://github.com/tomhub/cdisc-proxy.git
-cd cdisc-proxy
-
-# Install dependencies
-go mod download
-
-# Run tests (if available)
-go test ./...
-
-# Build
-go build -o cdisc-proxy main.go
-
-# Run locally
-./cdisc-proxy config.yaml
-```
-
-### Guidelines
-
-- Follow Go best practices and idioms
-- Add tests for new features
-- Update documentation
-- Keep commits atomic and well-described
-
----
-
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
----
-
-## 🙏 Acknowledgments
-
-- [CDISC](https://www.cdisc.org/) - For providing the clinical data standards and API
-- [Valkey](https://valkey.io/) - High-performance key-value store
-- Go Community - For excellent tools and libraries
-- Microsoft Copilot GPT-5 - for implementation of the idea
----
-
-## 📞 Support
-
-- **Issues**: [GitHub Issues](https://github.com/tomhub/cdisc-proxy/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/tomhub/cdisc-proxy/discussions)
-- **CDISC Library**: [CDISC Documentation](https://www.cdisc.org/cdisc-library)
+MIT. Do what you want. Just don’t pretend you weren’t warned.
 
 ---
 
 <div align="center">
-Made with ❤️ for the clinical research community
+🦡 Powered by Badgers. 🦝 Guarded by Racoons. Deployed by Enthusiasts. Made with ❤️ for the clinical research community.
 </div>
