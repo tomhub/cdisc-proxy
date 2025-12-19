@@ -627,99 +627,74 @@ func fnvHash(s string) uint64 {
     return h.Sum64()
 }
 
+func (ps *ProxyServer) fetchAndCapture(path, key, ns string) (CachedResponse, error) {
+    // 1. Direct Upstream Call
+    body, status, err := ps.fetchFromCDISC(context.Background(), path)
+    if err != nil {
+        return CachedResponse{}, err
+    }
+
+    res := CachedResponse{StatusCode: status, Body: body}
+
+    if status == http.StatusOK {
+        expiry := time.Now().Add(ps.l2TTL)
+        
+        // 2. Synchronous L2 Save
+        // We do NOT use a goroutine here. The leader waits until BadgerDB 
+        // confirms the write. This prevents the follower race condition.
+        entry, _ := json.Marshal(res)
+        if err := ps.storage.UpsertCache(key, entry, expiry, ns); err != nil {
+            log.Printf("[L2] Sync write failed: %v", err)
+        }
+
+        // 3. Asynchronous L1 Save
+        // L1 is memory-based and can remain async for speed
+        if len(body) < maxL1ObjectSize {
+            ps.asyncSaveToL1(key, res, ps.l1TTL)
+        }
+    }
+
+    return res, nil
+}
+
 // --- HTTP Handlers ---
 
 
 func (ps *ProxyServer) handleProxy(w http.ResponseWriter, r *http.Request) {
-	path := strings.TrimPrefix(r.URL.Path, "/api")
+    path := strings.TrimPrefix(r.URL.Path, "/api")
+    ns, _ := identifyNamespace(path)
+    cacheKey := buildCacheKey(r, ns)
 
-	if len(path) > maxPathLength {
-		http.Error(w, "Path too long", http.StatusBadRequest)
-		return
-	}	
-
-	if strings.Contains(path, "..") || !strings.HasPrefix(path, "/") {
-		http.Error(w, "Invalid path", http.StatusBadRequest)
-		return
-	}
-
-	
-	ns, ok := identifyNamespace(path)
-	if !ok {
-		// cache, still dedupe upstream calls
-		ns = "unknown-ns" // or misc
-	}
-
-	cacheKey := buildCacheKey(r, ns)
-
-	// --- TIER 1: L1 LOOKUP ---
-	if cached, ok := ps.getFromL1(r.Context(), cacheKey); ok {
-		ps.asyncUpdateL1TTLWithStatus(cacheKey, cached.StatusCode)
-		ps.writeResponse(w, cached, "L1-HIT")
-		return
-	}
-
-	// --- TIER 2: L2 LOOKUP (With Smart Promotion) ---
-	// We use a helper to determine if we should promote
-	if data, expiresAt, err := ps.storage.GetCache(cacheKey); err == nil && time.Now().Before(expiresAt) {
-		var cached CachedResponse
-		if err := json.Unmarshal(data, &cached); err != nil {
-			log.Printf("L2 cache corrupt for %s: %v", cacheKey, err)
-		} else {
-			if len(data) < maxL1ObjectSize {
-				ps.asyncPromoteToL1(cacheKey, cached)
-			} else {
-				log.Printf("[Tiering] L2 Hit: Skipping L1 promotion for large object (%d bytes)", len(data))
-			}
-			ps.writeResponse(w, cached, "L2-HIT")
-			return
-		}
-	}
-
-	// --- TIER 3: UPSTREAM (Singleflight + Hybrid Streaming) ---
-	// Fetch from upstream
-	// but do this as singleflight - avoid hammering upstream -
-	// only one request per path, others wait for cache
-
-	// The 'shared' boolean tells us if we were a follower (true) or the leader (false)
-    _, err, shared := ps.sf.Do(cacheKey, func() (interface{}, error) {
-		// IMPORTANT: only the singleflight leader executes this function.
-		// This function MUST be the only place that writes to ResponseWriter.
-        // Only the leader executes this. It streams directly to ITS 'w'.
-        return nil, ps.fetchAndStream(w, r, path, cacheKey, ns)
-    })
-
-	if err != nil {
-        log.Printf("CDISC API error for %s: %v", path, err)
-        // If the leader hasn't written a response yet, send error
-        http.Error(w, `{"error":"CDISC API Error"}`, http.StatusBadGateway)
+    // 1. Tier 1: L1 Check
+    if cached, ok := ps.getFromL1(r.Context(), cacheKey); ok {
+        ps.writeResponse(w, cached, "L1-HIT")
         return
     }
 
-	// If 'shared' is true, this request was a follower. 
-    // The leader has finished writing to its own ResponseWriter and filled the cache.
-    // Now the follower should serve from the cache.
-    if shared {
-        if cached, ok := ps.getFromL1(r.Context(), cacheKey); ok {
-            ps.writeResponse(w, cached, "L1-HIT-FOLLOW")
+    // 2. Tier 2: L2 Check
+    if data, _, err := ps.storage.GetCache(cacheKey); err == nil {
+        var cached CachedResponse
+        if err := json.Unmarshal(data, &cached); err == nil {
+            ps.writeResponse(w, cached, "L2-HIT")
             return
         }
-		if data, expiresAt, err := ps.storage.GetCache(cacheKey); err == nil && time.Now().Before(expiresAt) {
-			var cached CachedResponse
-			if err := json.Unmarshal(data, &cached); err == nil {
-				ps.writeResponse(w, cached, "L2-HIT-FOLLOW")
-				return
-			}
-		}
-		// If cache is empty, re-fetch directly (follower becomes temporary leader)
-		log.Printf("[Singleflight] Follower cache miss for %s, fetching directly", cacheKey)
-		body, status, err := ps.fetchFromCDISC(r.Context(), path)
-		if err != nil {
-			http.Error(w, `{"error":"CDISC API Error"}`, http.StatusBadGateway)
-			return
-		}
-		ps.writeResponse(w, CachedResponse{StatusCode: status, Body: body}, "MISS-FOLLOW")
     }
+
+    // 3. Tier 3: Upstream with Singleflight
+    // Return (interface{}, error) where interface{} is CachedResponse
+    val, err, _ := ps.sf.Do(cacheKey, func() (interface{}, error) {
+        // Leader fetches and captures
+        return ps.fetchAndCapture(path, cacheKey, ns)
+    })
+
+    if err != nil {
+        http.Error(w, `{"error":"Upstream Error"}`, http.StatusBadGateway)
+        return
+    }
+
+    // Leader and all 10,000 Followers get the result here from memory
+    res := val.(CachedResponse)
+    ps.writeResponse(w, res, "SF-COMPLETED")
 }
 
 func (ps *ProxyServer) getFromL1(ctx context.Context, key string) (CachedResponse, bool) {
