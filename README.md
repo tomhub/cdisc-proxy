@@ -1,181 +1,169 @@
-# 🚀 CDISC Library API Proxy
+# cdisc-proxy
 
-> A fast, **extremely opinionated**, mildly unhinged (by design) caching proxy for the **CDISC Library API**.
->
-> Built in Go. Tuned for production. Designed to survive real-world CDISC outages without flapping, stampeding, or waking you up at 03:00 because *someone reran the pipeline*.
->
-> Yes, it caches errors.  
-> No, that’s not a bug.  
-> Yes, we’ve thought about it more than you have.
+An untested caching proxy for the CDISC Library API.
 
----
+It exists because repeatedly hammering the same upstream endpoint is wasteful, slow, and something only **raccoons with a network cable** would design.  
+Badgers reviewed the design. They were unimpressed, but approved it anyway. 🦝🦡
 
-## 😈 What This Thing Does (And Why You’re Already Late to the Party)
-
-Let’s establish some uncomfortable truths[citation required]:
-
-- You do **not** control the CDISC Library API  
-- It will be slow, eventually  
-- It will be down, occasionally  
-- Your pipelines will react like toddlers on espresso  
-
-So this proxy exists to sit in the middle, arms crossed, and say:
-
-> “Absolutely not. You will not all panic at once.”
-
-### In one breath (because you’re busy):
-
-- **Always caches** (even non-200 responses, briefly, on purpose)
-- **Two-tier cache**
-  - ⚡ L1 RAM cache (Valkey / Redis / Dragonfly)
-  - 🗄️ L2 persistent cache (BadgerDB or PostgreSQL)
-- **Singleflight deduplication** — one upstream call, everyone else waits
-- **Streaming leader / cached followers**
-- **Namespace-aware invalidation** via `/mdr/lastupdated`
-- **Health checks that don’t scream** because CDISC sneezed
-
-If you’ve ever watched a CI pipeline accidentally DDoS CDISC…  
-congratulations, this proxy is your emotional support mammal.
+MIT licensed. Use it, fork it, question it.
 
 ---
 
-## 🧠 Big Picture (AKA “Where the Panic Is Contained”)
+## What it is
 
-```
-Client
-  │
-  ▼
-🧠 CDISC Proxy (this repo)
-  │
-  ├─ ⚡ L1 Cache (Valkey / Redis / Dragonfly)
-  │    └─ tiny, hot, easily offended
-  │
-  ├─ 🦡 L2 Cache (BadgerDB or PostgreSQL)
-  │    └─ durable, grumpy, hoards metadata forever
-  │
-  └─ 🌐 CDISC Library API
-       └─ singleflight protected (no stampedes, riots, or regrets)
-```
+`cdisc-proxy` is a **read-only reverse HTTP proxy** with deterministic caching, built specifically for CDISC Library API endpoints.
 
-Think of this as a shock absorber.  
-Or a bouncer.  
-Or a racoon guarding a dumpster full of cached metadata.
+It sits between your clients and the CDISC API and ensures that:
+- identical requests are treated identically
+- upstream calls are minimized
+- concurrency does not turn into chaos
 
 ---
 
-## 🏎️ The Life of a Request (No Fairy Tales)
+## What it does
 
-1. **L1 lookup** — hit? instant response.
-2. **L2 lookup** — hit? served from disk. Small enough? Copy self to L1.
-3. **Upstream call (singleflight)** — one request, many followers.
-
-No thundering herds.  
-No duplicate CDISC calls.  
-No surprise retrospectives.
+- Proxies **GET** requests under `/api/mdr/...`
+- Talks to CDISC Library API using an API key
+- Canonicalizes requests to avoid cache poisoning
+- Uses **two-tier caching**
+  - L1: Redis / Valkey (fast)
+  - L2: sled+filesystem blobs **or** PostgreSQL (durable)
+- Uses **single-flight** request coalescing
+- Applies negative caching for errors
+- Applies backpressure to upstream calls
+- Survives high concurrency without panicking
 
 ---
 
-## 🧊 Cache Keys (Yes, We Thought About This)
+## What it does *not* do
 
-```
-cdisc:cache:<namespace>:<request-uri>
+- ❌ Write or mutate upstream data
+- ❌ Pretend bad upstream responses are your fault
+- ❌ Authenticate users beyond an optional shared key
+- ❌ Care about badly written clients
+
+---
+
+## TODO
+
+- Test it
+- Break it
+- Patch it
+- Repeat it
+
+---
+
+## Installation
+
+### Build from source
+
+```bash
+git clone https://github.com/your-org/cdisc-proxy.git
+cd cdisc-proxy
+cargo build --release
 ```
 
-Status codes survive caching:
-
-```json
-{ "s": 404, "b": "{ \"error\": \"Not Found\" }" }
+Binary:
+```bash
+target/release/cdisc-proxy
 ```
 
-No fake 200s. No lies.
-
 ---
 
-## 😈 Negative Caching
+## Alpine Linux
 
-Non-200 responses are cached for 5 minutes:
-
-```go
-negativeCacheTTL = 5 * time.Minute
+```bash
+apk add --no-cache ca-certificates libgcc libstdc++ redis postgresql-client
+cp target/release/cdisc-proxy /usr/local/bin/
+mkdir -p /etc/conf.d
 ```
 
-Outages become boring.  
-Boring is good.
+Run:
+```bash
+cdisc-proxy /etc/conf.d/cdisc-proxy.conf
+```
 
 ---
 
-## 🧭 Namespace-Aware Invalidation
+## Ubuntu / Debian
 
-Uses `/mdr/lastupdated`.
+```bash
+apt update
+apt install -y redis postgresql-client ca-certificates
+cp target/release/cdisc-proxy /usr/local/bin/
+```
 
-Flush only what changed.  
-Not the universe.
-
----
-
-## 🤡 Why Not Just Use NGINX?
-
-You can.
-
-NGINX is a **dumb fridge**.  
-This proxy is a **judgmental racoon**.
-
-NGINX can’t:
-- Deduplicate upstream calls
-- Invalidate by CDISC namespace
-- Avoid stampedes
-- Understand CDISC semantics
+Run:
+```bash
+cdisc-proxy /etc/cdisc-proxy.yaml
+```
 
 ---
 
-## 🤡 Why Not Varnish?
+## Docker
 
-Varnish is excellent at:
-- Being fast
-- Being stateless
-- Being *your problem at 02:00*
-
-It still:
-- Has no idea what SDTM is
-- Can’t read `/mdr/lastupdated`
-- Will happily serve stale-but-fast lies
-- Requires ritual VCL sacrifices
+```dockerfile
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates libgcc libstdc++
+COPY cdisc-proxy /usr/local/bin/cdisc-proxy
+COPY cdisc-proxy.yaml /etc/cdisc-proxy.yaml
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/cdisc-proxy", "/etc/cdisc-proxy.yaml"]
+```
 
 ---
 
-## 📖 A True Story (Postmortem Edition, LLM Hallucination) [not true story]
+## Configuration
 
-**02:17 UTC**  
-CDISC slows down.
+Example:
 
-**02:18 UTC**  
-CI pipelines notice.
+```yaml
+server:
+  port: 8080
+  listen: ["0.0.0.0"]
+  auth_key: null
 
-**02:19 UTC**  
-400 identical requests hit `/mdr/sdtm`.
+cdisc:
+  base_url: "https://api.cdisc.org"
+  api_key: "REDACTED"
 
-**02:20 UTC**  
-NGINX shrugs.
+cache:
+  l1:
+    driver: "redis"
+    address: "redis://127.0.0.1:6379"
+    ttl: "10m"
 
-**02:21 UTC**  
-CDISC rate-limits you.
+  l2:
+    badger_path: "/var/lib/cdisc-proxy"
+    postgres_dsn: null
+    ttl: "30d"
+    cleanup_enabled: true
+    cleanup_interval: "1h"
 
-**02:22 UTC**  
-Slack explodes.
-
-With this proxy:
-- First request goes out
-- Others wait
-- Cache fills
-- Everyone goes back to sleep
+scheduler:
+  enabled: false
+  interval: "1h"
+```
 
 ---
 
-## 📜 License
+## Endpoints
 
-MIT. Do what you want. Just don’t pretend you weren’t warned.
+- `GET /api/mdr/...` — proxied CDISC Library API calls
+- `GET /health` — cached + live health checks
+
+Response header:
+```
+X-Cache-Tier: L1-HIT | L2-HIT | MISS
+```
 
 ---
+
+## License
+
+MIT.  
+Do what you want.  
+If it breaks, check your config before blaming the badgers.
 
 <div align="center">
 🦡 Powered by Badgers. 🦝 Guarded by Racoons. Deployed by Enthusiasts. Made with ❤️ for the clinical research community.
