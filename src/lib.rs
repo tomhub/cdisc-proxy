@@ -285,7 +285,7 @@ impl SledBlobAdapter {
         total
     }
 
-    async fn evict_under_pressure(&self) -> Result<u64> {
+    fn evict_under_pressure(&self) -> Result<u64> {
         let mut total = Self::blob_disk_usage(&self.blob_dir);
         if total <= self.eviction.max_bytes {
             return Ok(0);
@@ -474,9 +474,10 @@ impl StorageAdapter for SledBlobAdapter {
         }
 
         // Trigger eviction in background without awaiting
-        tokio::spawn(async move {
+        // Trigger eviction in background without awaiting (runs on blocking pool)
+        tokio::task::spawn_blocking(move || {
             let adapter = SledBlobAdapter { db: db_eviction, blob_dir, eviction };
-            let _ = adapter.evict_under_pressure().await;
+            let _ = adapter.evict_under_pressure();
         });
 
         Ok(())
@@ -921,6 +922,7 @@ impl ProxyServer {
 
         // Follower path
         if !is_leader {
+
             // Wait for result
             match rx.wait_for(|val| val.is_some()).await {
                 Ok(guard) => {
