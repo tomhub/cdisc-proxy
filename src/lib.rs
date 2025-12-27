@@ -82,7 +82,7 @@ pub struct L1Config {
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct L2Config {
-    badger_path: Option<String>,
+    storage_path: Option<String>,
     postgres_dsn: Option<String>,
     ttl: String,
     cleanup_enabled: bool,
@@ -189,14 +189,14 @@ impl L1Config {
 
 impl L2Config {
     pub fn new(
-        badger_path: Option<String>,
+        storage_path: Option<String>,
         postgres_dsn: Option<String>,
         ttl: impl Into<String>,
         cleanup_enabled: bool,
         cleanup_interval: impl Into<String>,
     ) -> Self {
         Self {
-            badger_path,
+            storage_path,
             postgres_dsn,
             ttl: ttl.into(),
             cleanup_enabled,
@@ -834,7 +834,7 @@ impl ProxyServer {
         l1_client.wait_for_connect().await?;
 
         // Initialize L2
-        let storage: Arc<dyn StorageAdapter> = if let Some(path) = &config.cache.l2.badger_path {
+        let storage: Arc<dyn StorageAdapter> = if let Some(path) = &config.cache.l2.storage_path {
             Arc::new(SledBlobAdapter::new(path).await?)
         } else if let Some(dsn) = &config.cache.l2.postgres_dsn {
             Arc::new(PostgresAdapter::new(dsn).await?)
@@ -1187,7 +1187,7 @@ pub fn validate_config(config: &AppConfig) -> Result<()> {
     if config.cache.l1.address.is_empty() {
         return Err(anyhow!("L1 address required"));
     }
-    if config.cache.l2.badger_path.is_none() && config.cache.l2.postgres_dsn.is_none() {
+    if config.cache.l2.storage_path.is_none() && config.cache.l2.postgres_dsn.is_none() {
         return Err(anyhow!("L2 storage required"));
     }
     Ok(())

@@ -123,7 +123,7 @@ server:
   auth_key: null
 
 cdisc:
-  base_url: "https://api.cdisc.org"
+  base_url: "https://library.cdisc.org/api"
   api_key: "REDACTED"
 
 cache:
@@ -133,7 +133,7 @@ cache:
     ttl: "10m"
 
   l2:
-    badger_path: "/var/lib/cdisc-proxy"
+    storage_path: "/var/lib/cdisc-proxy"
     postgres_dsn: null
     ttl: "30d"
     cleanup_enabled: true
