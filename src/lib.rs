@@ -1155,7 +1155,7 @@ fn identify_namespace(path: &str) -> (String, bool) {
     let ns = parts[0];
     let valid = matches!(
         ns,
-        "adam" | "sdtm" | "sdtmig" | "sendig" | "cdash" | "cdashig" | "qrs" | "ct" | "integrated"
+        "adam" | "sdtm" | "sdtmig" | "sendig" | "cdash" | "cdashig" | "qrs" | "ct" | "integrated" | "about" | "products"
     );
 
     (ns.to_string(), valid)
