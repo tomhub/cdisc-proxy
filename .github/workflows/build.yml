@@ -1,18 +1,18 @@
-name: Go Multi-Platform Build and Release
+name: Rust Multi-Platform Build and Release
 
 on:
   push:
     branches:
       - main
     tags:
-      - 'v*' # Trigger on version tags like v1.0.0
+      - 'v*'
   pull_request:
     branches:
       - main
 
 env:
-  GO_VERSION: '1.25'
-  APP_NAME: 'cdisc-proxy'
+  APP_NAME: cdisc-proxy
+  RUST_VERSION: stable
 
 jobs:
   build:
@@ -22,54 +22,43 @@ jobs:
       matrix:
         include:
           # Windows
-          - goos: windows
-            goarch: amd64
+          - target: x86_64-pc-windows-msvc
             output: cdisc-proxy-windows-amd64.exe
-          - goos: windows
-            goarch: arm64
+          - target: aarch64-pc-windows-msvc
             output: cdisc-proxy-windows-arm64.exe
-          
+
           # macOS
-          - goos: darwin
-            goarch: amd64
+          - target: x86_64-apple-darwin
             output: cdisc-proxy-darwin-amd64
-          - goos: darwin
-            goarch: arm64
+          - target: aarch64-apple-darwin
             output: cdisc-proxy-darwin-arm64
-          
+
           # Linux
-          - goos: linux
-            goarch: amd64
+          - target: x86_64-unknown-linux-gnu
             output: cdisc-proxy-linux-amd64
-          - goos: linux
-            goarch: arm64
+          - target: aarch64-unknown-linux-gnu
             output: cdisc-proxy-linux-arm64
-          - goos: linux
-            goarch: arm
-            goarm: '6'
+          - target: armv6-unknown-linux-gnueabihf
             output: cdisc-proxy-linux-armv6
-          
+
           # FreeBSD
-          - goos: freebsd
-            goarch: amd64
+          - target: x86_64-unknown-freebsd
             output: cdisc-proxy-freebsd-amd64
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
-          go-version: ${{ env.GO_VERSION }}
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: ${{ matrix.target }}
 
       - name: Build Binary
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          GOARM: ${{ matrix.goarm }}
         run: |
-          go build -ldflags="-s -w" -o ${{ matrix.output }}
+          cargo build --release --target ${{ matrix.target }}
+          cp target/${{ matrix.target }}/release/${{ env.APP_NAME }}* ${{ matrix.output }}
 
       - name: Upload Binary Artifact
         uses: actions/upload-artifact@v4
@@ -82,15 +71,14 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Download Linux AMD64 Binary
         uses: actions/download-artifact@v4
         with:
           name: cdisc-proxy-linux-amd64
 
-      - name: Extract Version from Tag
+      - name: Extract Version
         id: version
         run: |
           if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
@@ -99,19 +87,15 @@ jobs:
             VERSION="0.0.0-dev"
           fi
           echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "Building version: $VERSION"
 
-      - name: Create DEB Package Structure
+      - name: Build DEB Package
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          mkdir -p package/usr/local/bin
-          mkdir -p package/DEBIAN
-          
-          # Move binary
+          mkdir -p package/usr/local/bin package/DEBIAN
+
           chmod +x cdisc-proxy-linux-amd64
           mv cdisc-proxy-linux-amd64 package/usr/local/bin/cdisc-proxy
-          
-          # Create control file
+
           cat > package/DEBIAN/control << EOF
           Package: cdisc-proxy
           Version: $VERSION
@@ -122,63 +106,55 @@ jobs:
           Description: CDISC Library API Proxy Server
            A proxy server for CDISC Library API operations
           EOF
-          
-          # Build the package
+
           dpkg-deb --build package cdisc-proxy_${VERSION}_amd64.deb
 
-      - name: Upload DEB Package
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: cdisc-proxy-deb
           path: cdisc-proxy_*.deb
 
   package-rpm:
-    name: Create RPM Package (Fedora/RHEL/CentOS)
+    name: Create RPM Package
     runs-on: ubuntu-latest
     needs: build
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Download Linux AMD64 Binary
         uses: actions/download-artifact@v4
         with:
           name: cdisc-proxy-linux-amd64
 
-      - name: Extract Version from Tag
+      - name: Extract Version
         id: version
         run: |
           if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
             VERSION="${GITHUB_REF#refs/tags/v}"
             RPM_VERSION="$VERSION"
           else
-            # RPM doesn't allow hyphens in version, use tilde for pre-release
             VERSION="0.0.0-dev"
             RPM_VERSION="0.0.0~dev"
           fi
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "rpm_version=$RPM_VERSION" >> $GITHUB_OUTPUT
-          echo "Building version: $VERSION (RPM: $RPM_VERSION)"
 
-      - name: Install RPM Build Tools
+      - name: Install RPM Tools
         run: |
           sudo apt-get update
           sudo apt-get install -y rpm
 
-      - name: Create RPM Package
+      - name: Build RPM Package
         run: |
           VERSION="${{ steps.version.outputs.rpm_version }}"
           mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
           mkdir -p package/usr/local/bin
-          
-          # Move binary
+
           chmod +x cdisc-proxy-linux-amd64
           mv cdisc-proxy-linux-amd64 package/usr/local/bin/cdisc-proxy
-          
-          # Create tarball
+
           tar czf ~/rpmbuild/SOURCES/cdisc-proxy-${VERSION}.tar.gz -C package .
-          
-          # Create spec file
+
           cat > ~/rpmbuild/SPECS/cdisc-proxy.spec << EOF
           Name:           cdisc-proxy
           Version:        ${VERSION}
@@ -202,16 +178,14 @@ jobs:
           /usr/local/bin/cdisc-proxy
 
           %changelog
-          * $(date +"%a %b %d %Y") CDISC Proxy Team <https://github.com/tomhub/cdisc-proxy> - ${VERSION}-1
+          * $(date +"%a %b %d %Y") CDISC Proxy Team - ${VERSION}-1
           - Release ${VERSION}
           EOF
-          
-          # Build RPM
+
           rpmbuild -ba ~/rpmbuild/SPECS/cdisc-proxy.spec
           cp ~/rpmbuild/RPMS/x86_64/*.rpm ./
 
-      - name: Upload RPM Package
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: cdisc-proxy-rpm
           path: '*.rpm'
@@ -221,20 +195,17 @@ jobs:
     runs-on: macos-latest
     needs: build
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Download macOS ARM64 Binary
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           name: cdisc-proxy-darwin-arm64
 
-      - name: Download macOS AMD64 Binary
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           name: cdisc-proxy-darwin-amd64
 
-      - name: Extract Version from Tag
+      - name: Extract Version
         id: version
         run: |
           if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
@@ -243,28 +214,26 @@ jobs:
             VERSION="0.0.0-dev"
           fi
           echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "Building version: $VERSION"
 
       - name: Create Universal Binary
         run: |
           chmod +x cdisc-proxy-darwin-arm64 cdisc-proxy-darwin-amd64
           lipo -create -output cdisc-proxy cdisc-proxy-darwin-arm64 cdisc-proxy-darwin-amd64
 
-      - name: Create macOS PKG
+      - name: Build macOS PKG
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           mkdir -p package/usr/local/bin
           cp cdisc-proxy package/usr/local/bin/
           chmod +x package/usr/local/bin/cdisc-proxy
-          
+
           pkgbuild --root package \
                    --identifier com.github.tomhub.cdisc-proxy \
                    --version $VERSION \
                    --install-location / \
                    cdisc-proxy-${VERSION}-universal.pkg
 
-      - name: Upload macOS Package
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: cdisc-proxy-macos-pkg
           path: cdisc-proxy-*-universal.pkg
@@ -277,16 +246,13 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download All Artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v2
         with:
-          files: |
-            artifacts/**/*
+          files: artifacts/**/*
           draft: false
           prerelease: false
           generate_release_notes: true
