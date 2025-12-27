@@ -1,47 +1,59 @@
-# Binaries for programs and plugins
-*.exe
-*.exe~
-*.dll
-*.so
-*.dylib
+############################################
+# Rust / Cargo
+############################################
+
+target/
+**/*.rs.bk
+Cargo.lock
+
+############################################
+# Binaries
+############################################
+
 cdisc-proxy
 cdisc-proxy-*
 
-# Test binary, built with `go test -c`
-*.test
+############################################
+# Runtime cache & storage (sled / blobs)
+############################################
 
-# Output of the go coverage tool
-*.out
-coverage.txt
-coverage.html
+sled/
+blobs/
+test_sled/
+*.sled
 
-# Go workspace file
-go.work
-go.work.sum
-
-# Dependency directories
-vendor/
-
-# Go build cache
-.cache/
-
+############################################
 # Configuration files with secrets
-config.yaml
-*.conf
-!config.yaml.example
-!*.conf.example
+############################################
 
-# Environment files
+*.conf
+!*.conf.example
+config.yaml
+!config.yaml.example
 .env
 .env.*
 !.env.example
 
-# Log files
+############################################
+# Logs
+############################################
+
 *.log
 logs/
-/var/log/
+var/log/
 
-# IDE and editor files
+############################################
+# Temporary / runtime files
+############################################
+
+tmp/
+temp/
+*.tmp
+
+############################################
+# IDE / editor junk
+############################################
+
 .vscode/
 .idea/
 *.swp
@@ -50,54 +62,65 @@ logs/
 .DS_Store
 *.iml
 
-# Debug files
-debug
-__debug_bin
+############################################
+# OS-generated files
+############################################
 
-# Temporary files
-tmp/
-temp/
-*.tmp
-
-# OS generated files
 Thumbs.db
 .Spotlight-V100
 .Trashes
 
-# Build artifacts
+############################################
+# Build / distribution artifacts
+############################################
+
 dist/
 build/
 bin/
 
-# Alpine/Linux package files
+############################################
+# Archives / packages
+############################################
+
 *.apk
 *.tar.gz
 *.tgz
 
+############################################
 # Documentation build artifacts
+############################################
+
 docs/_build/
 site/
 
-# Backup files
+############################################
+# Backups
+############################################
+
 *.bak
 *.backup
-*~
 
-# Test coverage
-profile.cov
+############################################
+# Databases (local testing only)
+############################################
 
-# Private keys and certificates
+*.db
+*.sqlite
+*.sqlite3
+
+############################################
+# Redis / Valkey
+############################################
+
+dump.rdb
+appendonly.aof
+
+############################################
+# Certificates / keys (never commit these)
+############################################
+
 *.key
 *.pem
 *.crt
 *.p12
 *.pfx
-
-# Database files (if using local SQLite for testing)
-*.db
-*.sqlite
-*.sqlite3
-
-# Redis/Valkey dump files
-dump.rdb
-appendonly.aof
