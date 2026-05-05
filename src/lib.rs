@@ -981,16 +981,7 @@ impl ProxyServer {
 
         let body = resp.bytes().await?.to_vec();
 
-        if body.len() > MAX_L2_OBJECT_SIZE {
-            return Ok(CachedResponse {
-                status_code: status,
-                headers,
-                body,
-                expires_at: 0,
-            });
-        }
-
-        let ttl = if status < 400{
+        let ttl = if status < 400 {
             self.l2_ttl
         } else if status < 500 {
             NEGATIVE_CACHE_TTL_4XX
@@ -1000,6 +991,16 @@ impl ProxyServer {
 
         let expires_at = SystemTime::now() + ttl;
         let expires_ts = expires_at.duration_since(UNIX_EPOCH)?.as_secs();
+
+        // Too large to cache — return directly without writing to L1/L2.
+        if body.len() > MAX_L2_OBJECT_SIZE {
+            return Ok(CachedResponse {
+                status_code: status,
+                headers,
+                body,
+                expires_at: expires_ts,
+            });
+        }
 
         let cached = CachedResponse {
             status_code: status,
@@ -1118,9 +1119,10 @@ impl ProxyServer {
         }
 
         let body = serde_json::to_vec(&status).unwrap_or_else(|_| b"{}".to_vec());
+        let status_code = if is_healthy { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
 
         (
-            StatusCode::OK,
+            status_code,
             [("X-Health-Source", "Live")],
             body,
         )
@@ -1134,12 +1136,6 @@ impl ProxyServer {
 
 // Helper Functions
 fn identify_namespace(path: &str) -> (String, bool) {
-    let path = if path.starts_with("/api") {
-        path.strip_prefix("/api").unwrap_or(path)
-    } else {
-        path
-    };
-
     if !path.starts_with("/mdr/") {
         return ("".to_string(), false);
     }

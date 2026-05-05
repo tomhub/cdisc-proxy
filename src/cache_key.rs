@@ -13,8 +13,21 @@ pub fn canonical_cache_key(path_and_query: &str, ns: &str) -> String {
     let raw_path = parts.next().unwrap_or("");
     let raw_query = parts.next();
 
-    // Normalize path
-    let mut path = raw_path.trim().replace("//", "/");
+    // Normalize path: collapse repeated slashes in a single O(n) pass.
+    let raw = raw_path.trim();
+    let mut path = String::with_capacity(raw.len());
+    let mut prev_slash = false;
+    for c in raw.chars() {
+        if c == '/' {
+            if !prev_slash {
+                path.push(c);
+            }
+            prev_slash = true;
+        } else {
+            path.push(c);
+            prev_slash = false;
+        }
+    }
     if path.ends_with('/') && path != "/" {
         path.pop();
     }

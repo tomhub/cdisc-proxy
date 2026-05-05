@@ -5,9 +5,12 @@ use hyper::StatusCode;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::select;
+use tokio::task::JoinSet;
 use tracing::{info, error};
 
 use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::sync::Notify;
 
 use cdisc_proxy::{
     ProxyServer,
@@ -43,16 +46,31 @@ async fn main() -> Result<()> {
         config.server.listen.clone()
     };
 
-    let addr_str = format!("{}:{}", listen_addrs[0], config.server.port);
-    let addr: SocketAddr = addr_str.parse().context("invalid listen address")?;
+    let shutdown = Arc::new(Notify::new());
+    let mut set: JoinSet<Result<()>> = JoinSet::new();
 
-    info!("Listening on {}", addr);
+    for host in &listen_addrs {
+        let addr_str = format!("{}:{}", host, config.server.port);
+        let addr: SocketAddr = addr_str.parse().context("invalid listen address")?;
+        let listener = TcpListener::bind(addr).await.context("failed to bind to address")?;
+        info!("Listening on {}", addr);
 
-    let listener = TcpListener::bind(addr).await.context("failed to bind to address")?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("server failed")?;
+        let app = app.clone();
+        let shutdown = shutdown.clone();
+        set.spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move { shutdown.notified().await })
+                .await
+                .context("server failed")
+        });
+    }
+
+    shutdown_signal().await;
+    shutdown.notify_waiters();
+
+    while let Some(res) = set.join_next().await {
+        res??;
+    }
 
     Ok(())
 }
