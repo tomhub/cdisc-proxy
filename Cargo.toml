@@ -29,6 +29,7 @@ dashmap = "6.1"
 scopeguard = "1.2"
 url = "2.5"
 percent-encoding = "2.3"
+sha2 = "0.10"
 
 [dev-dependencies]
 tower = "0.5"

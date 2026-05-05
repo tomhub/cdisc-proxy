@@ -11,9 +11,9 @@ use fred::prelude::{Client as RedisClient, Config as RedisConfig, ClientLike, Ke
 use sled::Db as SledDb;
 use serde::{Deserialize, Serialize};
 use sqlx::{postgres::PgPoolOptions, PgPool};
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
-    hash::{Hash, Hasher},
     path::PathBuf,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -367,27 +367,22 @@ impl SledBlobAdapter {
     }
 
     fn get_blob_path_for_key_bytes(&self, key: &[u8]) -> PathBuf {
-        // Hash the key to create a filename (deterministic)
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        key.hash(&mut hasher);
-        let hash = hasher.finish();
-
-        // Use one-byte subdir to avoid too many files in a single dir; adjust if needed
-        let subdir = format!("{:02x}", (hash >> 56) & 0xFF);
-        let filename = format!("{:016x}.blob", hash);
-
-        self.blob_dir.join(subdir).join(filename)
+        Self::compute_blob_path(&self.blob_dir, key)
     }
 
-    /// Compute blob path from blob_dir and raw key bytes (same hashing as above).
-    /// This is a pure helper so blocking closures that don't have `self` can still
-    /// compute the exact same filename.
+    /// Compute blob path from blob_dir and raw key bytes.
+    /// Uses SHA-256 for a stable, collision-resistant filename that is
+    /// deterministic across Rust versions and platforms.
     fn compute_blob_path(blob_dir: &PathBuf, key_bytes: &[u8]) -> PathBuf {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        key_bytes.hash(&mut hasher);
-        let hash = hasher.finish();
-        let subdir = format!("{:02x}", (hash >> 56) & 0xFF);
-        let filename = format!("{:016x}.blob", hash);
+        let hash = Sha256::digest(key_bytes);
+        // First byte → 256 subdirs to keep directory entry counts manageable.
+        let subdir = format!("{:02x}", hash[0]);
+        // First 16 bytes (128-bit) → filename; negligible collision probability.
+        let filename: String = hash[..16]
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>()
+            + ".blob";
         blob_dir.join(subdir).join(filename)
     }
 
