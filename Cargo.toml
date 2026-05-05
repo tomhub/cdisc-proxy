@@ -6,8 +6,8 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0"
 axum = "0.8"
-hyper = "1.8"
-tokio = { version = "1.48", features = ["full"] }
+hyper = "1.9"
+tokio = { version = "1.52", features = ["full"] }
 tokio-util = "0.7"
 tower-http = { version = "0.6", features = ["timeout"] }
 reqwest = { version = "0.12", features = ["json", "gzip", "stream", "rustls-tls"] }
@@ -33,5 +33,5 @@ percent-encoding = "2.3"
 [dev-dependencies]
 tower = "0.5"
 http = "1"
-hyper = "1.8"
+hyper = "1.9"
 axum-extra = "0.9"
